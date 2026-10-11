@@ -463,6 +463,116 @@ client.setContentType("application/x-www-form-urlencoded");
 
 ---
 
+## Configuração TLS / HTTPS
+
+A biblioteca oferece suporte completo a conexões seguras TLS/HTTPS através do mbedTLS nativo do ESP32 (`NetworkClientSecure` no core 3.x, `WiFiClientSecure` no core 2.x).
+
+> [!IMPORTANT]
+> **Semântica de Ponteiros:** Certificados e chaves privadas são armazenados como **ponteiros** (não são copiados para a memória interna). Os buffers DEVEM permanecer válidos durante todo o ciclo de vida da instância `ESP32HTTPClient` (ex.: declarados como `static const char*`, constantes globais ou alocados em PROGMEM).
+>
+> **Sincronização de Relógio via NTP:** A validação do certificado TLS confere as datas de validade (`notBefore` e `notAfter`). Se o relógio interno do ESP32 não estiver sincronizado via NTP (iniciando em 1970 por padrão), a validação **falhará**. Sincronize a hora usando `configTime(0, 0, "pool.ntp.org")` logo após conectar ao WiFi.
+>
+> **Consumo de Memória (Heap):** Conexões TLS alocam buffers do mbedTLS (~45 KB de heap) sob demanda durante o primeiro handshake. Requisições `http://` puras ou clientes sem TLS configurado não sofrem nenhum impacto na memória RAM. Chame `client.end()` para fechar o socket e liberar imediatamente os buffers TLS.
+
+---
+
+### `setCACert(rootCA)`
+
+Configura o certificado da CA raiz (Root CA) em formato PEM para validar a cadeia de certificados do servidor.
+
+```cpp
+void setCACert(const char* rootCA);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `rootCA` | `const char*` | String terminada em nulo contendo o certificado da CA raiz em formato PEM (`"-----BEGIN CERTIFICATE-----\n..."`). O ponteiro é mantido, sem cópia. |
+
+**Exemplo:**
+```cpp
+static const char* isrg_root_x1 = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+client.setCACert(isrg_root_x1);
+```
+
+---
+
+### `setCACertBundle(bundle, size)`
+
+Configura um bundle de certificados X.509 (formato do `esp_crt_bundle` do ESP-IDF).
+
+```cpp
+void setCACertBundle(const uint8_t* bundle, size_t size = 0);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `bundle` | `const uint8_t*` | Ponteiro para os dados binários do bundle de certificados. |
+| `size` | `size_t` | Tamanho opcional do buffer do bundle em bytes (utilizado no arduino-esp32 >= 3.0.4). |
+
+---
+
+### `setClientCert(cert, key)`
+
+Configura o certificado e a chave privada do cliente para autenticação mútua TLS (mTLS).
+
+```cpp
+void setClientCert(const char* cert, const char* key);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `cert` | `const char*` | Certificado do cliente em formato PEM. Mantido por ponteiro. |
+| `key` | `const char*` | Chave privada do cliente em formato PEM. Mantido por ponteiro. |
+
+---
+
+### `setInsecure()`
+
+Desativa explicitamente a validação do certificado do servidor e do hostname.
+
+> [!WARNING]
+> Chamar `setInsecure()` desativa a validação TLS e deixa a comunicação vulnerável a ataques do tipo Man-in-the-Middle (MITM). Use esta opção apenas em ambiente local de desenvolvimento, testes ou certificados autoassinados onde a validação não for viável.
+
+```cpp
+void setInsecure();
+```
+
+---
+
+### `end()`
+
+Encerra a conexão ativa e libera os recursos associados. Para conexões TLS, fecha o socket seguro e libera os buffers internos do mbedTLS (~45 KB). O cliente continua funcional e pode abrir uma nova conexão na próxima requisição.
+
+```cpp
+void end();
+```
+
+---
+
+### `getTlsError()`
+
+Retorna o código de erro subjacente do mbedTLS (`int`) do último handshake ou tentativa de conexão TLS (valores negativos como `MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`). Retorna `0` se não houver erro de TLS.
+
+```cpp
+int getTlsError() const;
+```
+
+---
+
+### `getTlsErrorMessage()`
+
+Retorna uma mensagem legível com a descrição e representação hexadecimal do último erro de mbedTLS.
+
+```cpp
+String getTlsErrorMessage() const;
+```
+
 ## Inspeção de Resposta e Tratamento de Erros
 
 ---

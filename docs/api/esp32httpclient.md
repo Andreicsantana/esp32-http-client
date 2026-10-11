@@ -463,6 +463,116 @@ client.setContentType("application/x-www-form-urlencoded");
 
 ---
 
+## TLS / HTTPS Configuration
+
+The library provides robust TLS/HTTPS support powered by the underlying ESP32 mbedTLS stack (`NetworkClientSecure` on core 3.x, `WiFiClientSecure` on core 2.x).
+
+> [!IMPORTANT]
+> **Pointer Lifetime Semantics:** Certificates and keys are stored as **pointers**, not copied into internal memory. The buffers MUST remain valid for the entire lifetime of the `ESP32HTTPClient` instance (e.g., declared as `static const char*`, global constants, or stored in PROGMEM).
+>
+> **NTP Time Synchronization:** TLS certificate validation verifies the certificate's validity period (`notBefore` and `notAfter`). If the system clock is not synchronized via NTP (defaulting to Unix epoch 0 in 1970), certificate validation **will fail**. Synchronize time using `configTime(0, 0, "pool.ntp.org")` after WiFi connects.
+>
+> **Memory Impact:** TLS connections allocate mbedTLS buffers (~45 KB of heap) on demand during the first handshake. Plain `http://` requests or unconfigured clients incur zero TLS heap overhead. Call `client.end()` when done to immediately close the socket and free mbedTLS buffers.
+
+---
+
+### `setCACert(rootCA)`
+
+Configures a custom root CA certificate in PEM format for validating the server's certificate chain.
+
+```cpp
+void setCACert(const char* rootCA);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `rootCA` | `const char*` | Null-terminated string containing the Root CA certificate in PEM format (`"-----BEGIN CERTIFICATE-----\n..."`). Pointer is stored, not copied. |
+
+**Example:**
+```cpp
+static const char* isrg_root_x1 = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+client.setCACert(isrg_root_x1);
+```
+
+---
+
+### `setCACertBundle(bundle, size)`
+
+Configures an X.509 certificate bundle (ESP-IDF `esp_crt_bundle` format).
+
+```cpp
+void setCACertBundle(const uint8_t* bundle, size_t size = 0);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `bundle` | `const uint8_t*` | Pointer to the certificate bundle data. |
+| `size` | `size_t` | Optional size of the bundle buffer in bytes (used in arduino-esp32 >= 3.0.4). |
+
+---
+
+### `setClientCert(cert, key)`
+
+Configures mutual TLS (mTLS) client certificate and private key.
+
+```cpp
+void setClientCert(const char* cert, const char* key);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `cert` | `const char*` | Client certificate in PEM format. Stored by pointer. |
+| `key` | `const char*` | Client private key in PEM format. Stored by pointer. |
+
+---
+
+### `setInsecure()`
+
+Explicitly disables server certificate and hostname verification.
+
+> [!WARNING]
+> Calling `setInsecure()` disables TLS authentication and exposes all communication to Man-in-the-Middle (MITM) attacks. Use this only for local development, testing, or environments where certificate validation is impossible.
+
+```cpp
+void setInsecure();
+```
+
+---
+
+### `end()`
+
+Closes the active connection and releases associated resources. For TLS connections, this closes the secure socket and frees mbedTLS internal buffers (~45 KB). The client remains valid and can open a new connection on the next request.
+
+```cpp
+void end();
+```
+
+---
+
+### `getTlsError()`
+
+Returns the underlying mbedTLS error code (`int`) from the last TLS handshake or connection attempt (e.g., negative values such as `MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`). Returns `0` if no TLS error occurred.
+
+```cpp
+int getTlsError() const;
+```
+
+---
+
+### `getTlsErrorMessage()`
+
+Returns a human-readable description of the last mbedTLS error code, formatted with hexadecimal error code representation.
+
+```cpp
+String getTlsErrorMessage() const;
+```
+
 ## Response & Error Inspection
 
 ---

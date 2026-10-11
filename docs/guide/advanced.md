@@ -376,3 +376,65 @@ User parsedUser;
 ESP32HTTPClient::fromJson(jsonStr, &parsedUser);
 // Or: RestJson::fromJson(jsonStr, &parsedUser);
 ```
+
+---
+
+## TLS / HTTPS Security & Certificates
+
+`ESP32HTTPClient` includes built-in support for encrypted HTTPS connections with X.509 certificate validation, client certificate authentication (mTLS), and bundle support.
+
+### Buffer Lifetime (Pointer Semantics)
+
+Certificates and private keys are stored by **pointer** within `ESP32HTTPClient`. No dynamic copies are made on the heap. Therefore, ensure your certificate buffers remain valid in memory for the duration of the client:
+
+```cpp
+// Stored as static global memory or in PROGMEM
+static const char* isrg_root_ca =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIFazCCA1OgAwIBAgIRAIIQz7urnIjMvluidIT5FsAwDQYJKoZIhvcNAQELBQAw\n"
+    "...\n"
+    "-----END CERTIFICATE-----\n";
+
+void setup() {
+    client.setCACert(isrg_root_ca);
+}
+```
+
+### Mandatory NTP Time Synchronization
+
+TLS certificate chains include `Not Before` and `Not After` timestamp validations. Because the ESP32 hardware lacks a battery-backed RTC, its clock defaults to Unix epoch 0 (January 1, 1970) upon boot. Without time synchronization, the TLS stack will reject certificates as not yet valid (`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`).
+
+Always synchronize system time after WiFi connection:
+
+```cpp
+configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+time_t now = time(nullptr);
+while (now < 1577836800) { // Jan 1, 2020
+    delay(500);
+    now = time(nullptr);
+}
+```
+
+### Investigating TLS Errors
+
+If a handshake fails, inspect the granular mbedTLS error code:
+
+```cpp
+client.get("/todos/1");
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("TLS handshake failure: %s (code: -0x%04X)\n",
+                  client.getTlsErrorMessage().c_str(), -client.getTlsError());
+}
+```
+
+### Insecure Mode (Development Only)
+
+For local development or testing with self-signed certificates, certificate validation can be explicitly bypassed:
+
+```cpp
+client.setInsecure();
+```
+
+!!! warning "Security Hazard"
+    `setInsecure()` completely disables server certificate and hostname verification, making connections vulnerable to Man-in-the-Middle (MITM) attacks. Never deploy code with `setInsecure()` into production.
+

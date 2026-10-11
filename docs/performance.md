@@ -51,12 +51,22 @@ Modern APIs commonly respond with `Transfer-Encoding: chunked`. The library's `B
 
 ---
 
-## Memory Trade-offs
+## Memory Trade-offs & TLS Heap Lifecycle
 
-| Scenario | RAM freed by `end()` |
-| :--- | :--- |
-| Active TLS (HTTPS) connection | ~45 KB |
-| Active plain HTTP connection | ~5–10 KB |
+| Scenario | Heap allocated during request | RAM freed by `end()` |
+| :--- | :---: | :--- |
+| Plain HTTP connection (`http://`) | ~15 bytes | ~5–10 KB socket buffers |
+| TLS without config (`https://` default) | Core default | Core default |
+| Configured TLS (`setCACert`, bundle, etc.) | ~45 KB (mbedTLS buffers) | ~45 KB (TLS context + record buffers) |
+
+### On-Demand TLS Allocation
+
+`ESP32HTTPClient` uses lazy on-demand allocation for secure connections. The internal secure client is **not** initialized during object construction. Sketches communicating solely over `http://` incur **zero TLS heap overhead**.
+
+When an `https://` connection is established:
+1. **Initial Handshake:** mbedTLS allocates internal SSL contexts and TX/RX record buffers (~45 KB).
+2. **Session Reuse (Keep-Alive):** Subsequent requests to the same server reuse the already established TLS session, incurring no additional heap allocations and executing up to **12× faster**.
+3. **Releasing TLS Memory:** Calling `client.end()` terminates the TLS session, disconnects the socket, and frees the ~45 KB of mbedTLS buffers back to the heap. Subsequent calls will automatically initiate a fresh handshake when needed.
 
 Call `client.end()` after a burst of requests if your sketch enters a long idle period:
 

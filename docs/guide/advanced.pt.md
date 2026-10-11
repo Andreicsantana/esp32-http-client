@@ -376,3 +376,65 @@ User parsedUser;
 ESP32HTTPClient::fromJson(jsonStr, &parsedUser);
 // Ou: RestJson::fromJson(jsonStr, &parsedUser);
 ```
+
+---
+
+## Segurança e Certificados TLS / HTTPS
+
+O `ESP32HTTPClient` inclui suporte integrado a conexões criptografadas HTTPS com validação de certificados X.509, autenticação mútua com certificados de cliente (mTLS) e bundles de certificados.
+
+### Tempo de Vida dos Buffers (Semântica de Ponteiros)
+
+Certificados e chaves privadas são armazenados por **ponteiro** no `ESP32HTTPClient`. Nenhuma cópia dinâmica é criada na heap. Portanto, garanta que os buffers permaneçam válidos na memória enquanto o cliente existir:
+
+```cpp
+// Armazenado como constante estática global ou em PROGMEM
+static const char* isrg_root_ca =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIFazCCA1OgAwIBAgIRAIIQz7urnIjMvluidIT5FsAwDQYJKoZIhvcNAQELBQAw\n"
+    "...\n"
+    "-----END CERTIFICATE-----\n";
+
+void setup() {
+    client.setCACert(isrg_root_ca);
+}
+```
+
+### Sincronização Obrigatória de Relógio via NTP
+
+Cadeias de certificados TLS validam datas de emissão e expiração (`Not Before` e `Not After`). Como a placa ESP32 não possui RTC alimentado por bateria, seu relógio inicia no Unix epoch 0 (1 de janeiro de 1970) após a inicialização. Sem sincronização de relógio, o stack mbedTLS rejeitará certificados modernos por data inválida (`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`).
+
+Sempre sincronize a data/hora logo após a conexão WiFi:
+
+```cpp
+configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+time_t now = time(nullptr);
+while (now < 1577836800) { // 1 de janeiro de 2020
+    delay(500);
+    now = time(nullptr);
+}
+```
+
+### Investigação de Falhas de TLS
+
+Se um handshake falhar, inspecione o código e a descrição detalhada do erro mbedTLS:
+
+```cpp
+client.get("/todos/1");
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("Falha no handshake TLS: %s (código: -0x%04X)\n",
+                  client.getTlsErrorMessage().c_str(), -client.getTlsError());
+}
+```
+
+### Modo Inseguro (Apenas para Desenvolvimento)
+
+Para desenvolvimento em rede local ou testes com certificados autoassinados, a validação de certificados pode ser desativada explicitamente:
+
+```cpp
+client.setInsecure();
+```
+
+!!! warning "Risco de Segurança"
+    `setInsecure()` desativa totalmente a validação do certificado e do hostname, tornando as conexões vulneráveis a ataques Man-in-the-Middle (MITM). Nunca utilize `setInsecure()` em ambientes de produção.
+

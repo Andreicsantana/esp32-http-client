@@ -51,12 +51,22 @@ APIs modernas frequentemente respondem com `Transfer-Encoding: chunked`. O `Buff
 
 ---
 
-## Compensações de Memória (Trade-offs)
+## Compensações de Memória e Ciclo de Vida do Heap TLS
 
-| Cenário | RAM liberada por `end()` |
-| :--- | :--- |
-| Conexão TLS (HTTPS) ativa | ~45 KB |
-| Conexão HTTP simples ativa | ~5–10 KB |
+| Cenário | Heap alocado durante a requisição | RAM liberada por `end()` |
+| :--- | :---: | :--- |
+| Conexão HTTP simples (`http://`) | ~15 bytes | ~5–10 KB buffers de socket |
+| TLS sem configuração (`https://` padrão) | Padrão do core | Padrão do core |
+| TLS configurado (`setCACert`, bundle, etc.) | ~45 KB (buffers mbedTLS) | ~45 KB (contexto TLS + buffers de registro) |
+
+### Alocação de TLS Sob Demanda (Lazy Allocation)
+
+O `ESP32HTTPClient` aloca os recursos seguros sob demanda. O cliente seguro interno **não** é instanciado na construção do objeto. Projetos que se comunicam exclusivamente via `http://` têm **zero overhead de heap para TLS**.
+
+Quando uma conexão `https://` é aberta:
+1. **Handshake Inicial:** O mbedTLS aloca contextos SSL internos e buffers de registro TX/RX (~45 KB).
+2. **Reaproveitamento de Sessão (Keep-Alive):** Requisições consecutivas para o mesmo servidor reutilizam a sessão TLS existente sem alocações adicionais de memória, executando até **12× mais rápido**.
+3. **Liberação de Memória TLS:** Chamar `client.end()` encerra a sessão TLS, fecha o socket e devolve os ~45 KB de buffers mbedTLS para a heap livre. Requisições posteriores restabelecerão a conexão automaticamente se necessário.
 
 Chame `client.end()` após uma rajada de requisições se o seu sketch entrar em um longo período de inatividade:
 
