@@ -422,7 +422,7 @@ void SoapRequest::execute() {
     }
   }
 
-  http.begin(url);
+  _client->beginConnection(url, effectiveTimeout);
 
   if (!headerKeys.empty()) {
     http.collectHeaders(headerKeys.data(), headerKeys.size());
@@ -477,7 +477,7 @@ void SoapRequest::execute() {
 
     if (code < 0 && retries < maxRetries) {
       http.end();
-      http.begin(url);
+      _client->beginConnection(url, effectiveTimeout);
       if (!headerKeys.empty()) {
         http.collectHeaders(headerKeys.data(), headerKeys.size());
       }

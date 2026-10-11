@@ -861,7 +861,7 @@ void GraphQLRequest::execute() {
   headerKeys.push_back("Content-Type");
 
   auto setupConnection = [&]() {
-    http.begin(url);
+    _client->beginConnection(url, effectiveTimeout);
     if (!headerKeys.empty()) {
       http.collectHeaders(headerKeys.data(), headerKeys.size());
     }
