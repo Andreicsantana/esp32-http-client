@@ -10,6 +10,13 @@ ESP32HTTPClient::ESP32HTTPClient(const char* baseUrl, int port)
       _maxRetry(1),
       _contentType("application/json"),
       _soapVersion(SOAP_1_1),
+      _tlsCaCert(nullptr),
+      _tlsCaBundle(nullptr),
+      _tlsCaBundleSize(0),
+      _tlsClientCert(nullptr),
+      _tlsClientKey(nullptr),
+      _tlsTrust(TLS_TRUST_NONE),
+      _transport(TRANSPORT_NONE),
       _onSuccessCb(nullptr),
       _onErrorCb(nullptr),
       _onResponseCb(nullptr),
@@ -144,10 +151,160 @@ ESP32HTTPClient& ESP32HTTPClient::cookie(const char* name, const char* value) {
   return *this;
 }
 
-void ESP32HTTPClient::end() {
+void ESP32HTTPClient::invalidateTlsSession() {
   _http.setReuse(false);
   _http.end();
   _http.setReuse(true);
+#if ESP32HTTPCLIENT_HAS_TLS
+  if (_secure.get()) {
+    _secure.get()->stop();
+  }
+#endif
+  _transport = TRANSPORT_NONE;
+}
+
+void ESP32HTTPClient::end() {
+  invalidateTlsSession();
+}
+
+void ESP32HTTPClient::setCACert(const char* rootCA) {
+  invalidateTlsSession();
+  _tlsCaCert = rootCA;
+  _tlsCaBundle = nullptr;
+  _tlsCaBundleSize = 0;
+  _tlsTrust = TLS_TRUST_CA;
+#if ESP32HTTPCLIENT_HAS_TLS
+  esp32_http_client_detail::SecureClient* sec = _secure.get();
+  if (!sec) {
+    sec = &_secure.create();
+  }
+  sec->setCACert(rootCA);
+#endif
+}
+
+void ESP32HTTPClient::setCACertBundle(const uint8_t* bundle, size_t size) {
+  invalidateTlsSession();
+  _tlsCaBundle = bundle;
+  _tlsCaBundleSize = size;
+  _tlsCaCert = nullptr;
+  _tlsTrust = TLS_TRUST_BUNDLE;
+#if ESP32HTTPCLIENT_HAS_TLS
+  esp32_http_client_detail::SecureClient* sec = _secure.get();
+  if (!sec) {
+    sec = &_secure.create();
+  }
+  esp32_http_client_detail::applyCACertBundle(*sec, bundle, size, 0);
+#endif
+}
+
+void ESP32HTTPClient::setClientCert(const char* cert, const char* key) {
+  invalidateTlsSession();
+  _tlsClientCert = cert;
+  _tlsClientKey = key;
+#if ESP32HTTPCLIENT_HAS_TLS
+  esp32_http_client_detail::SecureClient* sec = _secure.get();
+  if (!sec) {
+    sec = &_secure.create();
+  }
+  sec->setCertificate(cert);
+  sec->setPrivateKey(key);
+#endif
+}
+
+void ESP32HTTPClient::setInsecure() {
+  invalidateTlsSession();
+  _tlsCaCert = nullptr;
+  _tlsCaBundle = nullptr;
+  _tlsCaBundleSize = 0;
+  _tlsTrust = TLS_TRUST_INSECURE;
+#if ESP32HTTPCLIENT_HAS_TLS
+  esp32_http_client_detail::SecureClient* sec = _secure.get();
+  if (!sec) {
+    sec = &_secure.create();
+  }
+  sec->setInsecure();
+#endif
+}
+
+int ESP32HTTPClient::getTlsError() const {
+#if ESP32HTTPCLIENT_HAS_TLS
+  if (_secure.get()) {
+    char buf[64] = {0};
+    return _secure.get()->lastError(buf, sizeof(buf));
+  }
+#endif
+  return 0;
+}
+
+String ESP32HTTPClient::getTlsErrorMessage() const {
+#if ESP32HTTPCLIENT_HAS_TLS
+  if (_secure.get()) {
+    char buf[128] = {0};
+    int err = _secure.get()->lastError(buf, sizeof(buf));
+    if (err != 0 || buf[0] != '\0') {
+      return String(buf);
+    }
+  }
+#endif
+  return "";
+}
+
+bool ESP32HTTPClient::hasTlsConfig() const {
+  return (_tlsTrust != TLS_TRUST_NONE) ||
+         (_tlsClientCert != nullptr && _tlsClientKey != nullptr);
+}
+
+bool ESP32HTTPClient::beginConnection(const String& url, uint16_t timeoutMs) {
+  if (timeoutMs > 0) {
+    _http.setTimeout(timeoutMs);
+  } else if (_timeout > 0) {
+    _http.setTimeout(_timeout);
+  }
+
+  bool isHttps = false;
+  int protoEnd = url.indexOf("://");
+  if (protoEnd > 0) {
+    String scheme = url.substring(0, protoEnd);
+    if (scheme.equalsIgnoreCase("https")) {
+      isHttps = true;
+    }
+  }
+
+  TransportKind target = TRANSPORT_PLAIN;
+  if (isHttps) {
+    target = hasTlsConfig() ? TRANSPORT_SECURE : TRANSPORT_DEFAULT_TLS;
+  } else {
+    target = TRANSPORT_PLAIN;
+  }
+
+  if (_transport != TRANSPORT_NONE && _transport != target) {
+    end();
+  }
+
+#if ESP32HTTPCLIENT_HAS_TLS
+  if (target == TRANSPORT_SECURE) {
+    esp32_http_client_detail::SecureClient* sec = _secure.get();
+    if (!sec) {
+      sec = &_secure.create();
+    }
+    if (_tlsTrust == TLS_TRUST_INSECURE) {
+      sec->setInsecure();
+    } else if (_tlsTrust == TLS_TRUST_CA && _tlsCaCert) {
+      sec->setCACert(_tlsCaCert);
+    } else if (_tlsTrust == TLS_TRUST_BUNDLE && _tlsCaBundle) {
+      esp32_http_client_detail::applyCACertBundle(*sec, _tlsCaBundle, _tlsCaBundleSize, 0);
+    }
+    if (_tlsClientCert && _tlsClientKey) {
+      sec->setCertificate(_tlsClientCert);
+      sec->setPrivateKey(_tlsClientKey);
+    }
+    _transport = target;
+    return _http.begin(*sec, url);
+  }
+#endif
+
+  _transport = target;
+  return _http.begin(url);
 }
 
 int ESP32HTTPClient::getStatusCode() const {

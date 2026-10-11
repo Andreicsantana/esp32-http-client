@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 
 #include "BufferedStreamReader.h"
+#include "ESP32HTTPClientTLS.h"
 #include "GraphQLRequest.h"
 #include "GraphQLTypes.h"
 #include "JsonRpcRequest.h"
@@ -60,6 +61,13 @@ class ESP32HTTPClient {
   ESP32HTTPClient& cookie(const char* name, const char* value);
   void end();
 
+  void setCACert(const char* rootCA);
+  void setCACertBundle(const uint8_t* bundle, size_t size = 0);
+  void setClientCert(const char* cert, const char* key);
+  void setInsecure();
+  int getTlsError() const;
+  String getTlsErrorMessage() const;
+
   void setSoapVersion(SoapVersion version);
   SoapVersion getSoapVersion() const;
 
@@ -100,6 +108,24 @@ class ESP32HTTPClient {
   }
 
  private:
+  enum TransportKind : uint8_t {
+    TRANSPORT_NONE = 0,
+    TRANSPORT_PLAIN,
+    TRANSPORT_DEFAULT_TLS,
+    TRANSPORT_SECURE
+  };
+
+  enum TlsTrustMode : uint8_t {
+    TLS_TRUST_NONE = 0,
+    TLS_TRUST_CA,
+    TLS_TRUST_BUNDLE,
+    TLS_TRUST_INSECURE
+  };
+
+  bool beginConnection(const String& url, uint16_t timeoutMs = 0);
+  bool hasTlsConfig() const;
+  void invalidateTlsSession();
+
   const char* _baseUrl;
   int _port;
   int _lastStatusCode;
@@ -108,6 +134,18 @@ class ESP32HTTPClient {
   const char* _contentType;
   SoapVersion _soapVersion;
   std::vector<HttpHeader> _headers;
+
+  const char* _tlsCaCert;
+  const uint8_t* _tlsCaBundle;
+  size_t _tlsCaBundleSize;
+  const char* _tlsClientCert;
+  const char* _tlsClientKey;
+  uint8_t _tlsTrust;
+  uint8_t _transport;
+
+#if ESP32HTTPCLIENT_HAS_TLS
+  esp32_http_client_detail::SecureClientSlot _secure;
+#endif
   HTTPClient _http;
 
   HttpResponseCallback _onSuccessCb;
