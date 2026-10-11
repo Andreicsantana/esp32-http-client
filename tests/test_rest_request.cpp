@@ -1895,6 +1895,304 @@ void testBufferedStreamReaderDirect() {
   HttpClientStub::reset();
 }
 
+static void testTlsDefaultBehavior() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  // 1. Plain HTTP without TLS config uses begin(url)
+  {
+    ESP32HTTPClient client("http://example.com");
+    expectTrue(!client.hasTlsConfig(), "Initial client should not have TLS config");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/ping").execute();
+    expectTrue(!HttpClientStub::usedSecureClient, "http:// must not use secure client");
+    expectEq(HttpClientStub::lastUrl, "http://example.com/ping", "Url should match");
+  }
+
+  // 2. HTTPS without TLS config maintains retrocompatible begin(url)
+  {
+    ESP32HTTPClient client("https://example.com");
+    expectTrue(!client.hasTlsConfig(), "HTTPS client without TLS config should have hasTlsConfig == false");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/secure").execute();
+    expectTrue(!HttpClientStub::usedSecureClient, "https:// without TLS config must maintain retrocompatible begin(url)");
+    expectEq(HttpClientStub::lastUrl, "https://example.com/secure", "Url should match");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsSettersAndSecureInjection() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  const char* dummyCA = "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n";
+  ESP32HTTPClient client("https://secure.example.com");
+  client.setCACert(dummyCA);
+
+  expectTrue(client.hasTlsConfig(), "Client should have TLS configured after setCACert");
+  expectEq(NetworkClientSecureStub::lastCACert, dummyCA, "NetworkClientSecure should receive root CA pointer");
+  expectTrue(!NetworkClientSecureStub::isInsecure, "Secure client should not be insecure");
+
+  // Request to https:// must inject the secure client
+  HttpClientStub::setResponse(200, "{\"status\":\"secure\"}");
+  client.get("/data").execute();
+
+  expectTrue(HttpClientStub::usedSecureClient, "https:// with CA configured must inject secure client");
+  expectTrue(HttpClientStub::lastSecureClient != nullptr, "Injected secure client pointer must not be null");
+
+  // Changing to http:// with CA configured must NOT use the secure client
+  client.setUrl("http://plain.example.com");
+  HttpClientStub::setResponse(200, "{\"status\":\"plain\"}");
+  client.get("/data").execute();
+
+  expectTrue(!HttpClientStub::usedSecureClient, "http:// must not use secure client even if CA is configured");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsAllSettersRepassValues() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://api.example.com");
+
+  // setCACertBundle
+  const uint8_t dummyBundle[] = {0x01, 0x02, 0x03, 0x04};
+  client.setCACertBundle(dummyBundle, sizeof(dummyBundle));
+  expectTrue(client.hasTlsConfig(), "Bundle configures TLS");
+  expectTrue(NetworkClientSecureStub::lastBundle == dummyBundle, "Bundle pointer passed to secure client");
+  expectEqInt(NetworkClientSecureStub::lastBundleSize, sizeof(dummyBundle), "Bundle size passed");
+  expectTrue(!NetworkClientSecureStub::isInsecure, "Bundle is not insecure");
+
+  // Test bundle template fallback overloads
+  struct MockBundle1Arg {
+    const uint8_t* b = nullptr;
+    void setCACertBundle(const uint8_t* bundle) { b = bundle; }
+  };
+  MockBundle1Arg m1;
+  expectTrue(esp32_http_client_detail::applyCACertBundle(m1, dummyBundle, sizeof(dummyBundle), 0), "1-arg bundle overload");
+  expectTrue(m1.b == dummyBundle, "1-arg bundle received pointer");
+
+  struct MockBundleNoArg {};
+  MockBundleNoArg mNone;
+  expectTrue(!esp32_http_client_detail::applyCACertBundle(mNone, dummyBundle, sizeof(dummyBundle), 0), "no-arg bundle fallback returns false");
+
+  // setClientCert
+  const char* dummyCert = "CLIENT_CERT_PEM";
+  const char* dummyKey = "CLIENT_KEY_PEM";
+  client.setClientCert(dummyCert, dummyKey);
+  expectEq(NetworkClientSecureStub::lastCert, dummyCert, "Client cert passed");
+  expectEq(NetworkClientSecureStub::lastKey, dummyKey, "Client key passed");
+
+  // setInsecure
+  client.setInsecure();
+  expectTrue(client.hasTlsConfig(), "Insecure configures TLS");
+  expectTrue(NetworkClientSecureStub::isInsecure, "Secure client set to insecure");
+  expectTrue(NetworkClientSecureStub::lastCACert == nullptr, "CA cert cleared on insecure");
+  expectTrue(NetworkClientSecureStub::lastBundle == nullptr, "Bundle cleared on insecure");
+
+  // Precedence: setCACert overrides previous setInsecure
+  const char* ca2 = "ROOT_CA_2";
+  client.setCACert(ca2);
+  expectTrue(!NetworkClientSecureStub::isInsecure, "setCACert must clear insecure flag");
+  expectEq(NetworkClientSecureStub::lastCACert, ca2, "New CA cert set");
+
+  // Precedence: setInsecure overrides previous setCACert
+  client.setInsecure();
+  expectTrue(NetworkClientSecureStub::isInsecure, "setInsecure must override previous CA");
+  expectTrue(NetworkClientSecureStub::lastCACert == nullptr, "CA must be cleared");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsReconfigureCallsStopAndLifecycle() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://api.example.com");
+  client.setCACert("INIT_CA");
+
+  HttpClientStub::setResponse(200, "{}");
+  client.get("/1").execute();
+
+  int stops = NetworkClientSecureStub::stopCallCount;
+
+  // Reconfiguring any setter calls stop()
+  client.setCACert("NEW_CA");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setCACert must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setInsecure();
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setInsecure must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setClientCert("C", "K");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setClientCert must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setCACertBundle(nullptr, 0);
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setCACertBundle must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // setBaseUrl calls stop()
+  client.setBaseUrl("https://other.example.com");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setBaseUrl must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // setPort calls stop()
+  client.setPort(8443);
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setPort must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // end() calls stop()
+  client.end();
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "end() must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // Reconnecting after end() works seamlessly
+  client.setCACert("RECONNECT_CA");
+  HttpClientStub::setResponse(200, "{\"reconnected\":true}");
+  client.get("/2").execute();
+  expectTrue(HttpClientStub::usedSecureClient, "Must reconnect using secure client after end()");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsRetryReusesSameClient() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://retry.example.com");
+  client.setCACert("CA_RETRY");
+  client.setMaxRetry(1);
+
+  // First attempt fails, second attempt succeeds
+  HttpClientStub::queueResponse(HTTPC_ERROR_CONNECTION_LOST, "");
+  HttpClientStub::queueResponse(200, "{\"success\":true}");
+
+  client.get("/data").execute();
+
+  expectEqInt(client.getStatusCode(), 200, "Request should succeed after retry");
+  expectEqInt(HttpClientStub::requestCount, 2, "Two attempts should have been made");
+  expectTrue(HttpClientStub::usedSecureClient, "Retry must use secure client");
+  expectTrue(HttpClientStub::lastSecureClient != nullptr, "Secure client must not be null");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsProtocolUnification() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  // Test GraphQL via single beginConnection
+  {
+    ESP32HTTPClient client("https://api.example.com");
+    client.setCACert("GRAPHQL_CA");
+    HttpClientStub::setResponse(200, "{\"data\":{\"name\":\"ESP32\"}}");
+    client.graphqlPost("/graphql").query("{ name }").execute();
+    expectTrue(HttpClientStub::usedSecureClient, "GraphQL POST must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "GRAPHQL_CA", "GraphQL CA cert passed");
+  }
+
+  // Test SOAP via single beginConnection
+  {
+    ESP32HTTPClient client("https://soap.example.com");
+    client.setCACert("SOAP_CA");
+    HttpClientStub::setResponse(200, "<soap:Envelope><soap:Body><res>ok</res></soap:Body></soap:Envelope>");
+    client.soap("/service").action("DoWork").execute();
+    expectTrue(HttpClientStub::usedSecureClient, "SOAP must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "SOAP_CA", "SOAP CA cert passed");
+  }
+
+  // Test JSON-RPC via single beginConnection
+  {
+    ESP32HTTPClient client("https://rpc.example.com");
+    client.setCACert("RPC_CA");
+    HttpClientStub::setResponse(200, "{\"jsonrpc\":\"2.0\",\"result\":\"pong\",\"id\":1}");
+    client.jsonRpc("/api").method("ping").id(1).execute();
+    expectTrue(HttpClientStub::usedSecureClient, "JSON-RPC must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "RPC_CA", "JSON-RPC CA cert passed");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsErrorsAndObservability() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://fail.example.com");
+  client.setCACert("FAIL_CA");
+
+  // Initial errors are 0 and empty
+  expectEqInt(client.getTlsError(), 0, "Initial TLS error should be 0");
+  expectEq(client.getTlsErrorMessage().c_str(), "", "Initial TLS error message should be empty");
+
+  // Set mock mbedtls error in secure client
+  NetworkClientSecureStub::lastErrorCode = -0x2700;
+  NetworkClientSecureStub::lastErrorMessage = "X509 - Certificate verification failed";
+
+  expectEqInt(client.getTlsError(), -0x2700, "getTlsError returns mbedtls code");
+  expectEq(client.getTlsErrorMessage().c_str(), "X509 - Certificate verification failed", "getTlsErrorMessage returns description");
+
+  // Trigger error flow in HTTPClient
+  HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+  bool errorCbFired = false;
+  int errorCbCode = 0;
+  String errorCbMsg = "";
+  client.onError([&](int code, const char* msg) {
+    errorCbFired = true;
+    errorCbCode = code;
+    errorCbMsg = msg;
+  });
+
+  bool obsFired = false;
+  client.onObservability([&](const ObservabilityMetrics&) {
+    obsFired = true;
+  });
+
+  client.get("/test").execute();
+
+  expectTrue(errorCbFired, "onError callback should be called on connection/handshake failure");
+  expectEqInt(errorCbCode, HTTPC_ERROR_CONNECTION_REFUSED, "Error code should match HTTPClient code");
+  expectEq(errorCbMsg.c_str(), "Connection Refused", "Error message should match errorToString");
+  expectTrue(obsFired, "Observability callback should fire on failure");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsKeepAliveSessionReuse() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://keepalive.example.com");
+  client.setCACert("KEEPALIVE_CA");
+
+  HttpClientStub::setResponse(200, "{\"r\":1}");
+  client.get("/one").execute();
+  void* client1 = HttpClientStub::lastSecureClient;
+  int stops1 = NetworkClientSecureStub::stopCallCount;
+
+  HttpClientStub::setResponse(200, "{\"r\":2}");
+  client.get("/two").execute();
+  void* client2 = HttpClientStub::lastSecureClient;
+  int stops2 = NetworkClientSecureStub::stopCallCount;
+
+  expectTrue(client1 != nullptr, "Client 1 must be non-null");
+  expectTrue(client1 == client2, "Persistent TLS session must reuse the same client pointer");
+  expectEqInt(stops1, stops2, "Keep-Alive requests must not stop client between requests");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
 
 }
 
@@ -1967,6 +2265,14 @@ int main() {
   runSuite("SkipValueEscapedString", testSkipValueEscapedString);
   runSuite("ObjectWithNestedArrayChildBinding", testObjectWithNestedArrayChildBinding);
   runSuite("BufferedStreamReaderDirect", testBufferedStreamReaderDirect);
+  runSuite("TlsDefaultBehavior", testTlsDefaultBehavior);
+  runSuite("TlsSettersAndSecureInjection", testTlsSettersAndSecureInjection);
+  runSuite("TlsAllSettersRepassValues", testTlsAllSettersRepassValues);
+  runSuite("TlsReconfigureCallsStopAndLifecycle", testTlsReconfigureCallsStopAndLifecycle);
+  runSuite("TlsRetryReusesSameClient", testTlsRetryReusesSameClient);
+  runSuite("TlsProtocolUnification", testTlsProtocolUnification);
+  runSuite("TlsErrorsAndObservability", testTlsErrorsAndObservability);
+  runSuite("TlsKeepAliveSessionReuse", testTlsKeepAliveSessionReuse);
 
   const int suitesFailed = suitesRun - suitesPassed;
   const double suitePassRate = suitesRun > 0 ? (100.0 * static_cast<double>(suitesPassed) / static_cast<double>(suitesRun)) : 0.0;

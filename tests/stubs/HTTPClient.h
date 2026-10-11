@@ -2,6 +2,7 @@
 #define HTTP_CLIENT_H
 
 #include "Arduino.h"
+#include "NetworkClientSecure.h"
 
 #include <deque>
 #include <string>
@@ -35,6 +36,8 @@ inline std::deque<std::vector<std::pair<std::string, std::string>>> responseHead
 inline std::vector<std::string> collectedHeaderKeys;
 inline Stream* customStream = nullptr;
 inline int customSize = 0;
+inline bool usedSecureClient = false;
+inline NetworkClientSecure* lastSecureClient = nullptr;
 
 class InMemoryStream : public Stream {
  public:
@@ -75,6 +78,8 @@ inline void reset() {
   collectedHeaderKeys.clear();
   customStream = nullptr;
   customSize = 0;
+  usedSecureClient = false;
+  lastSecureClient = nullptr;
 }
 
 inline void setResponse(int statusCode, const std::string& body) {
@@ -123,6 +128,15 @@ class HTTPClient {
 
   bool begin(String url) {
     HttpClientStub::lastUrl = url.c_str();
+    HttpClientStub::usedSecureClient = false;
+    HttpClientStub::lastSecureClient = nullptr;
+    return true;
+  }
+
+  bool begin(NetworkClientSecure& client, String url) {
+    HttpClientStub::lastUrl = url.c_str();
+    HttpClientStub::usedSecureClient = true;
+    HttpClientStub::lastSecureClient = &client;
     return true;
   }
 
