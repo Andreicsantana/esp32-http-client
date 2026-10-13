@@ -65,8 +65,13 @@ class ESP32HTTPClient {
   void setCACertBundle(const uint8_t* bundle, size_t size = 0);
   void setClientCert(const char* cert, const char* key);
   void setInsecure();
+  void requireValidatedTls(bool require = true);
+  bool isValidatedTlsRequired() const;
+  bool hasValidatedTlsConfig() const;
   int getTlsError() const;
   String getTlsErrorMessage() const;
+  String getTlsErrorHint() const;
+  static String tlsErrorToHint(int tlsError, long currentEpoch = -1);
 
   void setSoapVersion(SoapVersion version);
   SoapVersion getSoapVersion() const;
@@ -142,6 +147,7 @@ class ESP32HTTPClient {
   const char* _tlsClientKey;
   uint8_t _tlsTrust;
   uint8_t _transport;
+  bool _requireValidatedTls;
 
 #if ESP32HTTPCLIENT_HAS_TLS
   esp32_http_client_detail::SecureClientSlot _secure;

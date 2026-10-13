@@ -3,8 +3,41 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <new>
+
+#ifndef ESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS
+#define ESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS 0
+#endif
+
+#ifndef HTTPC_ERROR_TLS_NOT_VALIDATED
+#define HTTPC_ERROR_TLS_NOT_VALIDATED (-12)
+#endif
+
+#if defined(ESP32HTTPCLIENT_LOG_W) && defined(ESP32HTTPCLIENT_LOG_E)
+// Custom log macros already defined
+#elif defined(log_w) && defined(log_e)
+#define ESP32HTTPCLIENT_LOG_W(fmt, ...) log_w(fmt, ##__VA_ARGS__)
+#define ESP32HTTPCLIENT_LOG_E(fmt, ...) log_e(fmt, ##__VA_ARGS__)
+#else
+#define ESP32HTTPCLIENT_LOG_W(fmt, ...) do { (void)(fmt); } while (0)
+#define ESP32HTTPCLIENT_LOG_E(fmt, ...) do { (void)(fmt); } while (0)
+#endif
+
+namespace esp32_http_client_detail {
+
+static constexpr time_t kMinValidTlsEpoch = 1672531200;  // 2023-01-01 00:00:00 UTC
+
+inline time_t currentEpoch() {
+#if defined(ESP32HTTPCLIENT_CUSTOM_EPOCH_FN)
+  return ESP32HTTPCLIENT_CUSTOM_EPOCH_FN();
+#else
+  return time(nullptr);
+#endif
+}
+
+}  // namespace esp32_http_client_detail
 
 #if defined(HTTPCLIENT_NOSECURE)
 #define ESP32HTTPCLIENT_HAS_TLS 0
