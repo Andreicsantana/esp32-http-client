@@ -534,13 +534,57 @@ void setClientCert(const char* cert, const char* key);
 
 ### `setInsecure()`
 
-Desativa explicitamente a validação do certificado do servidor e do hostname.
+Desativa explicitamente a validação do certificado do servidor e do hostname, emitindo um log de aviso de segurança (`log_w`).
 
 > [!WARNING]
-> Chamar `setInsecure()` desativa a validação TLS e deixa a comunicação vulnerável a ataques do tipo Man-in-the-Middle (MITM). Use esta opção apenas em ambiente local de desenvolvimento, testes ou certificados autoassinados onde a validação não for viável.
+> Chamar `setInsecure()` desativa a validação TLS e deixa a comunicação vulnerável a ataques do tipo Man-in-the-Middle (MITM). Use esta opção apenas em ambiente local de desenvolvimento, testes ou certificados autoassinados onde a validação não for viável. Caso `requireValidatedTls(true)` esteja ativo, conexões HTTPS serão recusadas (`-12`) mesmo que `setInsecure()` tenha sido chamado.
 
 ```cpp
 void setInsecure();
+```
+
+---
+
+### `requireValidatedTls(require)`
+
+Ativa ou desativa o **modo "falhar fechado" (*fail-closed*)** para conexões TLS. Quando ativado (`true`), qualquer requisição `https://` sem uma CA Raiz (`setCACert`) ou bundle (`setCACertBundle`) configurado — ou com `setInsecure()` ativo — é recusada imediatamente antes de abrir o socket e retorna o código `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
+Também pode ser habilitado globalmente em tempo de compilação com a flag `-DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1`.
+
+```cpp
+void requireValidatedTls(bool require = true);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `require` | `bool` | `true` (padrão) para exigir validação de certificado em todas as requisições `https://`; `false` para permitir fallback com log de aviso. |
+
+**Exemplo:**
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(root_ca_pem);
+```
+
+---
+
+### `isValidatedTlsRequired()`
+
+Retorna `true` se o modo *fail-closed* de validação TLS estiver ativo nesta instância do cliente.
+
+```cpp
+bool isValidatedTlsRequired() const;
+```
+
+---
+
+### `hasValidatedTlsConfig()`
+
+Retorna `true` se houver uma CA Raiz (`setCACert`) ou bundle (`setCACertBundle`) não-vazio configurado e `setInsecure()` não estiver ativo.
+
+```cpp
+bool hasValidatedTlsConfig() const;
 ```
 
 ---
@@ -571,6 +615,33 @@ Retorna uma mensagem legível com a descrição e representação hexadecimal do
 
 ```cpp
 String getTlsErrorMessage() const;
+```
+
+---
+
+### `getTlsErrorHint()`
+
+Retorna uma dica prática de diagnóstico para a última falha de handshake TLS (ou bloqueio *fail-closed*), inspecionando o código mbedTLS e o relógio do sistema (`time(nullptr)`). Por exemplo, se a hora do sistema estiver antes de 2023, orienta sincronizar via NTP (`configTime()`). Retorna `""` caso nenhuma dica se aplique.
+
+```cpp
+String getTlsErrorHint() const;
+```
+
+**Exemplo:**
+```cpp
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("Dica TLS: %s\n", client.getTlsErrorHint().c_str());
+}
+```
+
+---
+
+### `tlsErrorToHint(tlsError, currentEpoch)`
+
+Método estático auxiliar que mapeia um código de erro do mbedTLS (e um timestamp Unix opcional `currentEpoch`; passe `-1` para consultar `time(nullptr)` automaticamente) para uma dica prática de solução.
+
+```cpp
+static String tlsErrorToHint(int tlsError, long currentEpoch = -1);
 ```
 
 ## Inspeção de Resposta e Tratamento de Erros
@@ -633,7 +704,7 @@ if (client.hasError()) {
 
 ### `getErrorMessage()`
 
-Retorna uma descrição legível do último código de status ou de erro retornado.
+Retorna uma descrição legível do último código de status ou de erro retornado. Quando uma requisição HTTPS falha com código negativo, `getErrorMessage()` anexa automaticamente a descrição e o código hexadecimal do mbedTLS junto com a dica prática de diagnóstico (`getTlsErrorHint()`).
 
 ```cpp
 String getErrorMessage() const;
@@ -823,6 +894,7 @@ client.get("/data3").getBody("v", &v3); // reconecta automaticamente
 | `-9` | Erro de Codificação | Erro do cliente |
 | `-10` | Erro de Escrita no Stream | Erro do cliente |
 | `-11` | Tempo Limite de Leitura | Erro do cliente |
+| `-12` | Validação TLS Obrigatória (`TLS Validation Required`) | Erro do cliente (TLS fail-closed) |
 | `200` | OK | Sucesso HTTP |
 | `201` | Criado | Sucesso HTTP |
 | `202` | Aceito | Sucesso HTTP |

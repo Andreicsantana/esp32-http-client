@@ -225,6 +225,7 @@ if (client.isSuccess()) {
 | `-9` | `HTTPC_ERROR_ENCODING` | Transfer encoding error. |
 | `-10` | `HTTPC_ERROR_STREAM_WRITE` | Stream write failed. |
 | `-11` | `HTTPC_ERROR_READ_TIMEOUT` | Timed out waiting for response data from server. |
+| `-12` | `HTTPC_ERROR_TLS_NOT_VALIDATED` | HTTPS request refused by fail-closed mode (`requireValidatedTls`) because no Root CA or CA bundle is configured. |
 
 #### HTTP Status Codes (`code > 0`)
 
@@ -381,7 +382,32 @@ ESP32HTTPClient::fromJson(jsonStr, &parsedUser);
 
 ## TLS / HTTPS Security & Certificates
 
-`ESP32HTTPClient` includes built-in support for encrypted HTTPS connections with X.509 certificate validation, client certificate authentication (mTLS), and bundle support.
+`ESP32HTTPClient` includes built-in support for encrypted HTTPS connections with X.509 certificate validation, client certificate authentication (mTLS), certificate bundles, fail-closed enforcement, and actionable mbedTLS error diagnostics.
+
+### How to Obtain the Right Root CA (`openssl s_client`)
+
+Do **not** pin the server's leaf certificate in your firmware — leaf certificates expire every 60 to 90 days (e.g., Let's Encrypt), which would break your devices as soon as the server renews its certificate. Instead, always pin the **Root CA** (the trust anchor at the top of the certificate chain).
+
+Run `openssl s_client` on your workstation to inspect the full certificate chain presented by your target server:
+
+```bash
+openssl s_client -showcerts -servername api.example.com -connect api.example.com:443 </dev/null
+```
+
+Look at the **last certificate** in the output (or check its `i:` / `Issuer` field). Copy that Root CA PEM block (`-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----`), or download the corresponding Root CA PEM directly from the Certificate Authority's official repository (such as **ISRG Root X1** for Let's Encrypt, **DigiCert Global Root G2**, or **Amazon Root CA 1**).
+
+### When to Use a Single Root CA vs. a Certificate Bundle
+
+| Approach | API | Flash Cost | When to Use |
+| :--- | :--- | :--- | :--- |
+| **Single Root CA** | `client.setCACert(root_ca_pem)` | **~1.5 – 2 KB** per PEM | **Recommended for single-backend IoT devices.** Use when your device talks to a fixed backend, cloud API, or MQTT/HTTPS broker whose PKI you control or know in advance. |
+| **Certificate Bundle** | `client.setCACertBundle(bundle, size)` | **~25 – 65 KB** | **Recommended for multi-domain / user-configured URLs.** Use when connecting to arbitrary webhooks, public APIs, or CDNs (e.g., Cloudflare, AWS CloudFront) that may dynamically switch between different Certificate Authorities (Let's Encrypt, Google Trust Services, DigiCert). |
+
+### Certificate & Root CA Expiration (Firmware Updates / OTA)
+
+- **Leaf Certificates**: Renewed frequently by servers (60–90 days). Because the ESP32 validates the chain against the **Root CA**, routine leaf certificate renewals require **no firmware update**.
+- **Root CA Certificates**: Root CAs have long lifetimes (typically 5–20 years), but they **do eventually expire**, can be revoked, or a cloud provider may migrate to a brand-new Root CA hierarchy (for example, the transition from DST Root CA X3 to ISRG Root X1, or Baltimore CyberTrust Root to DigiCert Global Root G2).
+- **Production Strategy**: Never deploy HTTPS-connected devices without an **OTA (Over-The-Air) firmware update** mechanism—or store your trusted Root CA PEMs in an updatable partition (such as LittleFS or NVS)—so you can roll out updated Root CAs before old roots expire.
 
 ### Buffer Lifetime (Pointer Semantics)
 
@@ -400,41 +426,77 @@ void setup() {
 }
 ```
 
+### Fail-Closed Mode (`requireValidatedTls`) & Security Warnings
+
+By default, if an `https://` request is made without calling `setCACert()` or `setCACertBundle()`, or when `setInsecure()` is used, `ESP32HTTPClient` emits an ESP32 warning log (`ESP32HTTPCLIENT_LOG_W` / `log_w`) alerting that TLS validation is not configured or has been bypassed.
+
+To enforce **fail-closed security** in production (refusing to connect over HTTPS if someone forgets to configure a Root CA or CA bundle, or accidentally leaves `setInsecure()` enabled), enable `requireValidatedTls(true)`:
+
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(isrg_root_ca); // If omitted, HTTPS requests fail immediately with -12
+```
+
+You can also enforce fail-closed mode globally across all `ESP32HTTPClient` instances at compile time in `platformio.ini` without modifying sketch code:
+
+```ini
+build_flags =
+    -DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1
+```
+
+When fail-closed mode blocks an unvalidated HTTPS request, no network socket is opened and the request immediately returns `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
 ### Mandatory NTP Time Synchronization
 
-TLS certificate chains include `Not Before` and `Not After` timestamp validations. Because the ESP32 hardware lacks a battery-backed RTC, its clock defaults to Unix epoch 0 (January 1, 1970) upon boot. Without time synchronization, the TLS stack will reject certificates as not yet valid (`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`).
+TLS certificate chains include `Not Before` and `Not After` timestamp validations. Because the ESP32 hardware lacks a battery-backed RTC, its clock defaults to Unix epoch 0 (January 1, 1970) upon boot. Without time synchronization, the TLS stack will reject certificates as not yet valid (`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`, `-0x2700`).
 
 Always synchronize system time after WiFi connection:
 
 ```cpp
 configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 time_t now = time(nullptr);
-while (now < 1577836800) { // Jan 1, 2020
+while (now < 1672531200) { // Jan 1, 2023
     delay(500);
     now = time(nullptr);
 }
 ```
 
-### Investigating TLS Errors
+### Actionable TLS Error Diagnostics (`getTlsErrorHint`)
 
-If a handshake fails, inspect the granular mbedTLS error code:
+When a TLS handshake fails, a generic `"Connection Refused"` (`-1`) is rarely enough to pinpoint the root cause. `ESP32HTTPClient` automatically enriches `client.getErrorMessage()` with the underlying mbedTLS hex code and an actionable diagnostic hint, and also provides `client.getTlsErrorHint()` (and static `ESP32HTTPClient::tlsErrorToHint(tlsError, currentEpoch)`):
+
+| Root Cause | mbedTLS Code(s) | Diagnostic Hint Returned |
+| :--- | :--- | :--- |
+| **System clock not synced (NTP)** | `-0x2700` (with system clock `< 2023`) | System clock is before 2023 (unsynchronized); call `configTime(0, 0, "pool.ntp.org")` via NTP before HTTPS requests. |
+| **Wrong Root CA / Expired Cert / Hostname mismatch** | `-0x2700` (`X509_CERT_VERIFY_FAILED`) | Certificate verification failed: check that the Root CA matches the server chain (`openssl s_client -showcerts`), the certificate is not expired, and the URL hostname matches the certificate CN/SAN. |
+| **Invalid PEM / DER format** | `-0x2180` .. `-0x3E80` | Invalid certificate/key format: verify the PEM string includes `-----BEGIN/END CERTIFICATE-----` markers, newline `\n` characters, and remains valid in memory. |
+| **Low Heap Memory** | `-0x7F00`, `-0x2880`, `-0x0010` | Out of heap memory during TLS handshake (~45 KB contiguous free RAM required). Call `client.end()` on idle clients. |
+| **Fatal Alert / mTLS Required** | `-0x7780` (`SSL_FATAL_ALERT_MESSAGE`) | Server rejected the TLS handshake (check if mutual TLS `setClientCert()` is required, SNI hostname, or cipher compatibility). |
+| **SNI / Server Certificate Missing** | `-0x7280`, `-0x7880`, `-0x7100`, `-0x7680` | Handshake negotiation failed or no certificate matched the requested hostname (SNI). |
 
 ```cpp
 client.get("/todos/1");
-if (client.hasError() && client.getTlsError() != 0) {
-    Serial.printf("TLS handshake failure: %s (code: -0x%04X)\n",
-                  client.getTlsErrorMessage().c_str(), -client.getTlsError());
+if (client.hasError()) {
+    // Prints full error + mbedTLS hex code + actionable hint
+    Serial.printf("Error (%d): %s\n",
+                  client.getStatusCode(), client.getErrorMessage().c_str());
+
+    if (client.getTlsError() != 0) {
+        Serial.printf("TLS Code: -0x%04X | Hint: %s\n",
+                      -client.getTlsError(), client.getTlsErrorHint().c_str());
+    }
 }
 ```
 
 ### Insecure Mode (Development Only)
 
-For local development or testing with self-signed certificates, certificate validation can be explicitly bypassed:
+For local development or testing with self-signed certificates, certificate validation can be explicitly bypassed (unless `requireValidatedTls(true)` is enabled):
 
 ```cpp
 client.setInsecure();
 ```
 
 !!! warning "Security Hazard"
-    `setInsecure()` completely disables server certificate and hostname verification, making connections vulnerable to Man-in-the-Middle (MITM) attacks. Never deploy code with `setInsecure()` into production.
+    `setInsecure()` logs a warning and completely disables server certificate and hostname verification, making connections vulnerable to Man-in-the-Middle (MITM) attacks. Never deploy code with `setInsecure()` into production.
+
 

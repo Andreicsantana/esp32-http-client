@@ -13,6 +13,24 @@ const char* password = "YOUR_PASSWORD";
 // TLS / HTTPS Root Certificate
 //
 // Root CA for jsonplaceholder.typicode.com (ISRG Root X1 / Let's Encrypt).
+//
+// How to obtain the Root CA for any server:
+//   openssl s_client -showcerts -servername jsonplaceholder.typicode.com \
+//     -connect jsonplaceholder.typicode.com:443 </dev/null
+// Copy the LAST certificate in the chain (or its Root CA issuer).
+//
+// Single Root CA vs Certificate Bundle:
+// - setCACert(pem): Minimal RAM/Flash (~1-2 KB). Best when connecting to a
+//   known backend or single cloud provider.
+// - setCACertBundle(bundle, size): Uses ESP-IDF's x509_crt_bundle (~60 KB Flash)
+//   covering 130+ public CAs. Best when connecting to arbitrary domains or
+//   CDNs (like Cloudflare) that may rotate across different Root CAs.
+//
+// Certificate & Root CA Expiration:
+//   Even Root CAs eventually expire or get rotated by servers/CDNs. Always
+//   include an OTA (Over-The-Air) firmware update mechanism or load the CA
+//   from LittleFS/NVS so deployed devices are not bricked when a CA changes.
+//
 // IMPORTANT: Certificates and keys are stored by POINTER, not copied.
 // They must remain valid in memory (e.g. static, const char*, or PROGMEM)
 // for the entire lifetime of the ESP32HTTPClient instance.
@@ -52,8 +70,8 @@ void syncNtpTime() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   time_t now = time(nullptr);
-  // Wait until time is updated (year > 2020 -> epoch > 1577836800)
-  while (now < 1577836800) {
+  // Wait until time is updated (year >= 2023 -> epoch >= 1672531200)
+  while (now < 1672531200) {
     delay(500);
     Serial.print(".");
     now = time(nullptr);
@@ -80,6 +98,9 @@ void setup() {
 
   // 2. Synchronize NTP clock (MANDATORY for TLS certificate validation)
   syncNtpTime();
+
+  // 3. Enable fail-closed mode: refuse HTTPS if CA or bundle is not configured
+  client.requireValidatedTls(true);
 }
 
 void loop() {
@@ -87,12 +108,13 @@ void loop() {
   Serial.printf("Initial Free Heap: %u bytes\n", ESP.getFreeHeap());
 
   // --------------------------------------------------------------------------
-  // Example 1: Validated HTTPS Request with Root CA
+  // Example 1: Validated HTTPS Request with Root CA (Fail-Closed Active)
   // --------------------------------------------------------------------------
   Serial.println("\n--- [1] HTTPS GET with Root CA Validation ---");
 
   // Configure Root CA (stored by pointer, buffer must outlive the client)
   client.setCACert(isrg_root_x1_ca);
+  client.requireValidatedTls(true);
 
   // Measure timing and memory for first TLS handshake
   uint32_t tStart = millis();
@@ -113,11 +135,12 @@ void loop() {
     Serial.printf("Heap delta (TLS buffers in memory): %d bytes\n", (int)(heapBefore - heapAfter));
     Serial.printf("Response -> Todo #%d: %s\n", todoId, title);
   } else {
-    Serial.printf("Request failed! HTTP status: %d, Error: %s\n",
+    // getErrorMessage() includes the mbedTLS hex code and actionable hint
+    Serial.printf("Request failed! Status: %d\nError: %s\n",
                   client.getStatusCode(), client.getErrorMessage().c_str());
     if (client.getTlsError() != 0) {
-      Serial.printf("TLS Error Code: -0x%04X, Details: %s\n",
-                    -client.getTlsError(), client.getTlsErrorMessage().c_str());
+      Serial.printf("TLS Code: -0x%04X | Hint: %s\n",
+                    -client.getTlsError(), client.getTlsErrorHint().c_str());
     }
   }
 
@@ -151,9 +174,10 @@ void loop() {
   // Example 4: Insecure HTTPS (Bypass Certificate Validation)
   // WARNING: Disables server certificate and hostname verification!
   // Leaves connection vulnerable to Man-in-the-Middle (MITM) attacks.
-  // Use ONLY for development, self-signed certificates, or testing.
+  // Note: Must disable requireValidatedTls(false) to allow setInsecure().
   // --------------------------------------------------------------------------
   Serial.println("\n--- [4] Insecure HTTPS Mode (Development / Testing) ---");
+  client.requireValidatedTls(false);
   client.setInsecure();
 
   client.get("/todos/3")

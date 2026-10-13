@@ -534,13 +534,57 @@ void setClientCert(const char* cert, const char* key);
 
 ### `setInsecure()`
 
-Explicitly disables server certificate and hostname verification.
+Explicitly disables server certificate and hostname verification, and emits a security warning log (`log_w`).
 
 > [!WARNING]
-> Calling `setInsecure()` disables TLS authentication and exposes all communication to Man-in-the-Middle (MITM) attacks. Use this only for local development, testing, or environments where certificate validation is impossible.
+> Calling `setInsecure()` disables TLS authentication and exposes all communication to Man-in-the-Middle (MITM) attacks. Use this only for local development, testing, or environments where certificate validation is impossible. If `requireValidatedTls(true)` is active, HTTPS requests will be refused (`-12`) even if `setInsecure()` was called.
 
 ```cpp
 void setInsecure();
+```
+
+---
+
+### `requireValidatedTls(require)`
+
+Enables or disables **fail-closed TLS mode**. When enabled (`true`), any `https://` request made without a configured Root CA (`setCACert`) or CA bundle (`setCACertBundle`), or while `setInsecure()` is active, is immediately refused before opening a socket and sets status code `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
+Can also be enabled globally at compile time via `-DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1`.
+
+```cpp
+void requireValidatedTls(bool require = true);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `require` | `bool` | `true` (default) to enforce validated TLS on all `https://` requests; `false` to allow fallback with a warning log. |
+
+**Example:**
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(root_ca_pem);
+```
+
+---
+
+### `isValidatedTlsRequired()`
+
+Returns `true` if fail-closed TLS validation mode is enabled on this client instance.
+
+```cpp
+bool isValidatedTlsRequired() const;
+```
+
+---
+
+### `hasValidatedTlsConfig()`
+
+Returns `true` if a non-empty Root CA (`setCACert`) or CA bundle (`setCACertBundle`) is configured and `setInsecure()` is not active.
+
+```cpp
+bool hasValidatedTlsConfig() const;
 ```
 
 ---
@@ -571,6 +615,33 @@ Returns a human-readable description of the last mbedTLS error code, formatted w
 
 ```cpp
 String getTlsErrorMessage() const;
+```
+
+---
+
+### `getTlsErrorHint()`
+
+Returns an actionable troubleshooting hint for the last TLS handshake failure (or fail-closed rejection), inspecting both the mbedTLS error code and the current system clock (`time(nullptr)`). For example, if the system clock is before 2023, it advises synchronizing time via NTP (`configTime()`). Returns `""` if no hint applies.
+
+```cpp
+String getTlsErrorHint() const;
+```
+
+**Example:**
+```cpp
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("TLS Hint: %s\n", client.getTlsErrorHint().c_str());
+}
+```
+
+---
+
+### `tlsErrorToHint(tlsError, currentEpoch)`
+
+Static helper that maps an mbedTLS error code (and optional Unix timestamp `currentEpoch`; pass `-1` to query `time(nullptr)` automatically) to an actionable diagnostic hint string.
+
+```cpp
+static String tlsErrorToHint(int tlsError, long currentEpoch = -1);
 ```
 
 ## Response & Error Inspection
@@ -633,7 +704,7 @@ if (client.hasError()) {
 
 ### `getErrorMessage()`
 
-Returns a human-readable description of the last status or error code.
+Returns a human-readable description of the last status or error code. When an HTTPS request fails with a negative status code, `getErrorMessage()` automatically appends the mbedTLS error message, hex code, and actionable diagnostic hint (`getTlsErrorHint()`).
 
 ```cpp
 String getErrorMessage() const;
@@ -729,6 +800,9 @@ void onError(HttpResponseCallback cb);
 ```cpp
 client.onError([](int code, const char* message) {
     Serial.printf("Client request failed (%d): %s\n", code, message);
+});
+```
+
 ---
 
 ### `onResponse(cb)`
@@ -820,6 +894,7 @@ client.get("/data3").getBody("v", &v3); // reconnects automatically
 | `-9` | Encoding Error | Client error |
 | `-10` | Stream Write Error | Client error |
 | `-11` | Read Timeout | Client error |
+| `-12` | TLS Validation Required | Client error (fail-closed TLS) |
 | `200` | OK | HTTP success |
 | `201` | Created | HTTP success |
 | `202` | Accepted | HTTP success |
