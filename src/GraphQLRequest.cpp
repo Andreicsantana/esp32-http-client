@@ -860,8 +860,10 @@ void GraphQLRequest::execute() {
   }
   headerKeys.push_back("Content-Type");
 
-  auto setupConnection = [&]() {
-    _client->beginConnection(url, effectiveTimeout);
+  auto setupConnection = [&]() -> bool {
+    if (!_client->beginConnection(url, effectiveTimeout)) {
+      return false;
+    }
     if (!headerKeys.empty()) {
       http.collectHeaders(headerKeys.data(), headerKeys.size());
     }
@@ -878,11 +880,12 @@ void GraphQLRequest::execute() {
     if (_method != HTTP_GET_METHOD) {
       http.addHeader("Content-Type", GRAPHQL_CONTENT_TYPE_JSON);
     }
+    return true;
   };
 
-  setupConnection();
+  bool connected = setupConnection();
 
-  int code = 0;
+  int code = connected ? 0 : _client->_lastStatusCode;
   int retries = 0;
   int maxRetries = (_maxRetry >= 0) ? _maxRetry : _client->getMaxRetry();
   int maxAttempts = 1 + maxRetries;
@@ -894,7 +897,7 @@ void GraphQLRequest::execute() {
     startTime = millis();
   }
 
-  while (retries < maxAttempts) {
+  while (connected && retries < maxAttempts) {
     if (_method == HTTP_GET_METHOD) {
       code = http.GET();
     } else {

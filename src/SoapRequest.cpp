@@ -422,14 +422,16 @@ void SoapRequest::execute() {
     }
   }
 
-  _client->beginConnection(url, effectiveTimeout);
+  bool connected = _client->beginConnection(url, effectiveTimeout);
 
-  if (!headerKeys.empty()) {
+  if (connected && !headerKeys.empty()) {
     http.collectHeaders(headerKeys.data(), headerKeys.size());
   }
 
-  for (const auto& header : _client->_headers) {
-    http.addHeader(header.name, header.value);
+  if (connected) {
+    for (const auto& header : _client->_headers) {
+      http.addHeader(header.name, header.value);
+    }
   }
 
   String contentType;
@@ -444,10 +446,10 @@ void SoapRequest::execute() {
       }
       contentType += "\"";
     }
-    http.addHeader("Content-Type", contentType.c_str());
+    if (connected) http.addHeader("Content-Type", contentType.c_str());
   } else {
     contentType = "text/xml; charset=utf-8";
-    http.addHeader("Content-Type", contentType.c_str());
+    if (connected) http.addHeader("Content-Type", contentType.c_str());
 
     String formattedAction;
     if (_soapAction.startsWith("\"") && _soapAction.endsWith("\"")) {
@@ -455,12 +457,12 @@ void SoapRequest::execute() {
     } else {
       formattedAction = "\"" + _soapAction + "\"";
     }
-    http.addHeader("SOAPAction", formattedAction.c_str());
+    if (connected) http.addHeader("SOAPAction", formattedAction.c_str());
   }
 
   String payload = buildEnvelope();
 
-  int code = 0;
+  int code = connected ? 0 : _client->_lastStatusCode;
   int retries = 0;
   int maxRetries = (_maxRetry >= 0) ? _maxRetry : _client->_maxRetry;
   int maxAttempts = 1 + maxRetries;
@@ -472,7 +474,7 @@ void SoapRequest::execute() {
     startTime = millis();
   }
 
-  while (retries < maxAttempts) {
+  while (connected && retries < maxAttempts) {
     code = http.POST(payload);
 
     if (code < 0 && retries < maxRetries) {

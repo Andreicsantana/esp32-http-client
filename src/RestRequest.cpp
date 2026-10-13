@@ -303,23 +303,25 @@ void RestRequest::execute() {
     }
   }
 
-  _client->beginConnection(url, effectiveTimeout);
+  bool connected = _client->beginConnection(url, effectiveTimeout);
 
-  if (!headerKeys.empty()) {
+  if (connected && !headerKeys.empty()) {
     http.collectHeaders(headerKeys.data(), headerKeys.size());
   }
 
-  for (const auto& header : _client->_headers) {
-    http.addHeader(header.name, header.value);
+  if (connected) {
+    for (const auto& header : _client->_headers) {
+      http.addHeader(header.name, header.value);
+    }
   }
 
   String payload = "";
   if (!_rawBody.isEmpty()) {
     payload = _rawBody;
-    http.addHeader("Content-Type", _client->_contentType);
+    if (connected) http.addHeader("Content-Type", _client->_contentType);
   } else if (!_bodyParams.empty()) {
     payload.reserve(_bodyParams.size() * 64);
-    http.addHeader("Content-Type", _client->_contentType);
+    if (connected) http.addHeader("Content-Type", _client->_contentType);
     payload += "{";
     for (size_t i = 0; i < _bodyParams.size(); i++) {
       payload += "\"";
@@ -339,7 +341,7 @@ void RestRequest::execute() {
     payload += "}";
   }
 
-  int code = 0;
+  int code = connected ? 0 : _client->_lastStatusCode;
   int retries = 0;
   int maxRetries = (_maxRetry >= 0) ? _maxRetry : _client->_maxRetry;
   int maxAttempts = 1 + maxRetries;
@@ -351,7 +353,7 @@ void RestRequest::execute() {
     startTime = millis();
   }
 
-  while (retries < maxAttempts) {
+  while (connected && retries < maxAttempts) {
     switch (_method) {
       case HTTP_GET_METHOD:
         code = http.GET();
