@@ -2127,6 +2127,7 @@ static void testTlsProtocolUnification() {
 static void testTlsErrorsAndObservability() {
   HttpClientStub::reset();
   NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
 
   ESP32HTTPClient client("https://fail.example.com");
   client.setCACert("FAIL_CA");
@@ -2134,6 +2135,7 @@ static void testTlsErrorsAndObservability() {
   // Initial errors are 0 and empty
   expectEqInt(client.getTlsError(), 0, "Initial TLS error should be 0");
   expectEq(client.getTlsErrorMessage().c_str(), "", "Initial TLS error message should be empty");
+  expectEq(client.getTlsErrorHint().c_str(), "", "Initial TLS error hint should be empty");
 
   // Set mock mbedtls error in secure client
   NetworkClientSecureStub::lastErrorCode = -0x2700;
@@ -2162,11 +2164,194 @@ static void testTlsErrorsAndObservability() {
 
   expectTrue(errorCbFired, "onError callback should be called on connection/handshake failure");
   expectEqInt(errorCbCode, HTTPC_ERROR_CONNECTION_REFUSED, "Error code should match HTTPClient code");
-  expectEq(errorCbMsg.c_str(), "Connection Refused", "Error message should match errorToString");
+  expectTrue(errorCbMsg.indexOf("Connection Refused") >= 0, "Error message should include Connection Refused");
+  expectTrue(errorCbMsg.indexOf("-0x2700") >= 0, "Error message should include mbedTLS hex code");
+  expectTrue(errorCbMsg.indexOf("Hint:") >= 0, "Error message should include diagnostic hint");
   expectTrue(obsFired, "Observability callback should fire on failure");
 
   HttpClientStub::reset();
   NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+}
+
+static void testTlsDiagnosticHintsAndNtpClock() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+
+  // 0 error code returns empty hint
+  expectEq(ESP32HTTPClient::tlsErrorToHint(0).c_str(), "", "tlsErrorToHint(0) is empty");
+
+  // 0x2700 with unsynchronized clock (< 2023)
+  String ntpHint = ESP32HTTPClient::tlsErrorToHint(-0x2700, 100000L);
+  expectTrue(ntpHint.indexOf("before 2023") >= 0, "0x2700 with old clock mentions before 2023");
+  expectTrue(ntpHint.indexOf("NTP") >= 0, "0x2700 with old clock mentions NTP");
+
+  // 0x2700 with synchronized clock (>= 2023)
+  String certHint = ESP32HTTPClient::tlsErrorToHint(-0x2700, 1700000000L);
+  expectTrue(certHint.indexOf("openssl s_client -showcerts") >= 0, "0x2700 with synced clock mentions openssl s_client");
+
+  // Invalid PEM / X509 format codes
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x2180, 1700000000L).indexOf("BEGIN CERTIFICATE") >= 0, "0x2180 hint mentions PEM format");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x3D00, 1700000000L).indexOf("BEGIN CERTIFICATE") >= 0, "0x3D00 hint mentions PEM format");
+
+  // Heap allocation failure codes
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7F00, 1700000000L).indexOf("client.end()") >= 0, "0x7F00 hint mentions client.end()");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x0010, 1700000000L).indexOf("client.end()") >= 0, "0x0010 hint mentions client.end()");
+
+  // Fatal alert
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7780, 1700000000L).indexOf("Fatal TLS alert") >= 0, "0x7780 hint mentions fatal alert");
+
+  // Peer EOF / close notify
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7280, 1700000000L).indexOf("Peer closed") >= 0, "0x7280 hint mentions peer closed");
+
+  // mTLS client cert required
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7680, 1700000000L).indexOf("setClientCert") >= 0, "0x7680 hint mentions setClientCert");
+
+  // Network timeout / reset
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6800, 1700000000L).indexOf("setTimeout") >= 0, "0x6800 hint mentions setTimeout");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x004C, 1700000000L).indexOf("setTimeout") >= 0, "0x004C hint mentions setTimeout");
+
+  // TCP connect / DNS failure
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x0042, 1700000000L).indexOf("DNS") >= 0, "0x0042 hint mentions DNS");
+
+  // Generic unknown mbedTLS code with old clock vs synced clock
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6000, 500L).indexOf("before 2023") >= 0, "unknown code with old clock mentions before 2023");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6000, 1700000000L).indexOf("TLS handshake failed") >= 0, "unknown code with synced clock mentions TLS handshake failed");
+
+  // Test client-level hint when tlsError == 0, status == -1, and system clock is before 2023
+  {
+    ArduinoStub::mockEpoch = 100L;  // 1970 (no NTP)
+    ESP32HTTPClient client("https://ntp-missing.example.com");
+    client.setCACert("SOME_CA");
+    HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+    client.get("/ping").retry(0).execute();
+
+    String hint = client.getTlsErrorHint();
+    String errMsg = client.getErrorMessage();
+    expectTrue(hint.indexOf("before 2023") >= 0, "getTlsErrorHint detects unsynced clock on HTTPS -1");
+    expectTrue(errMsg.indexOf("before 2023") >= 0, "getErrorMessage includes NTP hint when clock < 2023");
+  }
+
+  // Test client-level hint when tlsError == 0, status == -1, synced clock, and DEFAULT_TLS used
+  {
+    ArduinoStub::mockEpoch = 1700000000L;
+    ESP32HTTPClient client("https://default-tls.example.com");
+    HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+    client.get("/ping").retry(0).execute();
+
+    String hint = client.getTlsErrorHint();
+    expectTrue(hint.indexOf("without a configured Root CA") >= 0, "getTlsErrorHint advises configuring Root CA on default TLS failure");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+}
+
+static void testTlsFailClosedAndWarnings() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+
+  expectEq(ESP32HTTPClient::errorToString(HTTPC_ERROR_TLS_NOT_VALIDATED).c_str(),
+           "TLS Validation Required",
+           "errorToString(-12) returns TLS Validation Required");
+
+  // 1. Warning logged when setInsecure() is called and used
+  {
+    ArduinoStub::resetLogs();
+    ESP32HTTPClient client("https://insecure.example.com");
+    expectTrue(!client.isValidatedTlsRequired(), "requireValidatedTls defaults to false");
+    expectTrue(!client.hasValidatedTlsConfig(), "hasValidatedTlsConfig initially false");
+
+    client.setInsecure();
+    expectTrue(ArduinoStub::warningLogCount >= 1, "setInsecure() logs a security warning");
+    expectTrue(ArduinoStub::lastWarningLog.find("setInsecure()") != std::string::npos, "Warning mentions setInsecure()");
+    expectTrue(!client.hasValidatedTlsConfig(), "setInsecure() does not count as validated TLS");
+
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/data").execute();
+    expectTrue(ArduinoStub::warningLogCount >= 2, "Executing HTTPS with setInsecure() logs warning");
+  }
+
+  // 2. Warning logged when DEFAULT_TLS path is used (HTTPS without CA or bundle)
+  {
+    ArduinoStub::resetLogs();
+    ESP32HTTPClient client("https://unconfigured.example.com");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/data").execute();
+    expectTrue(ArduinoStub::warningLogCount >= 1, "HTTPS with DEFAULT_TLS logs a warning");
+    expectTrue(ArduinoStub::lastWarningLog.find("without setCACert()") != std::string::npos, "Warning mentions missing setCACert()");
+  }
+
+  // 3. Fail-closed mode (requireValidatedTls(true)) blocks unconfigured HTTPS
+  {
+    ArduinoStub::resetLogs();
+    HttpClientStub::reset();
+    ESP32HTTPClient client("https://strict.example.com");
+    client.requireValidatedTls(true);
+    expectTrue(client.isValidatedTlsRequired(), "isValidatedTlsRequired() is true");
+
+    bool errCalled = false;
+    int errCode = 0;
+    String errMsg;
+    client.get("/secret")
+          .onError([&](int c, const char* m) {
+            errCalled = true;
+            errCode = c;
+            errMsg = m;
+          })
+          .execute();
+
+    expectEqInt(HttpClientStub::requestCount, 0, "Fail-closed mode must not dispatch network request");
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "Status code is HTTPC_ERROR_TLS_NOT_VALIDATED (-12)");
+    expectTrue(client.hasError(), "hasError() is true when blocked by requireValidatedTls");
+    expectTrue(errCalled, "onError callback fired when blocked by requireValidatedTls");
+    expectEqInt(errCode, HTTPC_ERROR_TLS_NOT_VALIDATED, "onError received -12");
+    expectTrue(errMsg.indexOf("requireValidatedTls(true)") >= 0, "Error message explains requireValidatedTls failure");
+    expectTrue(ArduinoStub::errorLogCount >= 1, "Error log emitted on fail-closed refusal");
+  }
+
+  // 4. Fail-closed mode also blocks setInsecure(), SOAP, GraphQL, and JSON-RPC without CA
+  {
+    ArduinoStub::resetLogs();
+    HttpClientStub::reset();
+    ESP32HTTPClient client("https://strict.example.com");
+    client.requireValidatedTls(true);
+    client.setInsecure();
+
+    client.get("/rest").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "setInsecure() blocked by requireValidatedTls on REST");
+    expectTrue(client.getTlsErrorHint().indexOf("setInsecure() is not allowed") >= 0, "Hint explains setInsecure is not allowed");
+
+    client.soap("/ws").action("Act").body("<x/>").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "SOAP blocked by requireValidatedTls");
+
+    client.graphql("/graphql").query("{ ping }").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "GraphQL blocked by requireValidatedTls");
+
+    client.jsonRpc("/rpc").method("ping").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "JSON-RPC blocked by requireValidatedTls");
+    expectEqInt(HttpClientStub::requestCount, 0, "Zero network requests sent across all protocols when blocked");
+
+    // Once a valid CA or bundle is configured, requests succeed!
+    client.setCACert("-----BEGIN CERTIFICATE-----\nVALID\n-----END CERTIFICATE-----\n");
+    expectTrue(client.hasValidatedTlsConfig(), "hasValidatedTlsConfig() is true after setCACert");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/rest").execute();
+    expectEqInt(client.getStatusCode(), 200, "HTTPS succeeds in fail-closed mode after setCACert");
+
+    const uint8_t bundle[] = {0x01, 0x02};
+    client.setCACertBundle(bundle, sizeof(bundle));
+    expectTrue(client.hasValidatedTlsConfig(), "hasValidatedTlsConfig() is true after setCACertBundle");
+    client.get("/rest2").execute();
+    expectEqInt(client.getStatusCode(), 200, "HTTPS succeeds in fail-closed mode after setCACertBundle");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
 }
 
 static void testTlsKeepAliveSessionReuse() {
@@ -2272,6 +2457,8 @@ int main() {
   runSuite("TlsRetryReusesSameClient", testTlsRetryReusesSameClient);
   runSuite("TlsProtocolUnification", testTlsProtocolUnification);
   runSuite("TlsErrorsAndObservability", testTlsErrorsAndObservability);
+  runSuite("TlsDiagnosticHintsAndNtpClock", testTlsDiagnosticHintsAndNtpClock);
+  runSuite("TlsFailClosedAndWarnings", testTlsFailClosedAndWarnings);
   runSuite("TlsKeepAliveSessionReuse", testTlsKeepAliveSessionReuse);
 
   const int suitesFailed = suitesRun - suitesPassed;
