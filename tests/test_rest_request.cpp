@@ -1895,6 +1895,489 @@ void testBufferedStreamReaderDirect() {
   HttpClientStub::reset();
 }
 
+static void testTlsDefaultBehavior() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  // 1. Plain HTTP without TLS config uses begin(url)
+  {
+    ESP32HTTPClient client("http://example.com");
+    expectTrue(!client.hasTlsConfig(), "Initial client should not have TLS config");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/ping").execute();
+    expectTrue(!HttpClientStub::usedSecureClient, "http:// must not use secure client");
+    expectEq(HttpClientStub::lastUrl, "http://example.com/ping", "Url should match");
+  }
+
+  // 2. HTTPS without TLS config maintains retrocompatible begin(url)
+  {
+    ESP32HTTPClient client("https://example.com");
+    expectTrue(!client.hasTlsConfig(), "HTTPS client without TLS config should have hasTlsConfig == false");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/secure").execute();
+    expectTrue(!HttpClientStub::usedSecureClient, "https:// without TLS config must maintain retrocompatible begin(url)");
+    expectEq(HttpClientStub::lastUrl, "https://example.com/secure", "Url should match");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsSettersAndSecureInjection() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  const char* dummyCA = "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n";
+  ESP32HTTPClient client("https://secure.example.com");
+  client.setCACert(dummyCA);
+
+  expectTrue(client.hasTlsConfig(), "Client should have TLS configured after setCACert");
+  expectEq(NetworkClientSecureStub::lastCACert, dummyCA, "NetworkClientSecure should receive root CA pointer");
+  expectTrue(!NetworkClientSecureStub::isInsecure, "Secure client should not be insecure");
+
+  // Request to https:// must inject the secure client
+  HttpClientStub::setResponse(200, "{\"status\":\"secure\"}");
+  client.get("/data").execute();
+
+  expectTrue(HttpClientStub::usedSecureClient, "https:// with CA configured must inject secure client");
+  expectTrue(HttpClientStub::lastSecureClient != nullptr, "Injected secure client pointer must not be null");
+
+  // Changing to http:// with CA configured must NOT use the secure client
+  client.setUrl("http://plain.example.com");
+  HttpClientStub::setResponse(200, "{\"status\":\"plain\"}");
+  client.get("/data").execute();
+
+  expectTrue(!HttpClientStub::usedSecureClient, "http:// must not use secure client even if CA is configured");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsAllSettersRepassValues() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://api.example.com");
+
+  // setCACertBundle
+  const uint8_t dummyBundle[] = {0x01, 0x02, 0x03, 0x04};
+  client.setCACertBundle(dummyBundle, sizeof(dummyBundle));
+  expectTrue(client.hasTlsConfig(), "Bundle configures TLS");
+  expectTrue(NetworkClientSecureStub::lastBundle == dummyBundle, "Bundle pointer passed to secure client");
+  expectEqInt(NetworkClientSecureStub::lastBundleSize, sizeof(dummyBundle), "Bundle size passed");
+  expectTrue(!NetworkClientSecureStub::isInsecure, "Bundle is not insecure");
+
+  // Test bundle template fallback overloads
+  struct MockBundle1Arg {
+    const uint8_t* b = nullptr;
+    void setCACertBundle(const uint8_t* bundle) { b = bundle; }
+  };
+  MockBundle1Arg m1;
+  expectTrue(esp32_http_client_detail::applyCACertBundle(m1, dummyBundle, sizeof(dummyBundle), 0), "1-arg bundle overload");
+  expectTrue(m1.b == dummyBundle, "1-arg bundle received pointer");
+
+  struct MockBundleNoArg {};
+  MockBundleNoArg mNone;
+  expectTrue(!esp32_http_client_detail::applyCACertBundle(mNone, dummyBundle, sizeof(dummyBundle), 0), "no-arg bundle fallback returns false");
+
+  // setClientCert
+  const char* dummyCert = "CLIENT_CERT_PEM";
+  const char* dummyKey = "CLIENT_KEY_PEM";
+  client.setClientCert(dummyCert, dummyKey);
+  expectEq(NetworkClientSecureStub::lastCert, dummyCert, "Client cert passed");
+  expectEq(NetworkClientSecureStub::lastKey, dummyKey, "Client key passed");
+
+  // setInsecure
+  client.setInsecure();
+  expectTrue(client.hasTlsConfig(), "Insecure configures TLS");
+  expectTrue(NetworkClientSecureStub::isInsecure, "Secure client set to insecure");
+  expectTrue(NetworkClientSecureStub::lastCACert == nullptr, "CA cert cleared on insecure");
+  expectTrue(NetworkClientSecureStub::lastBundle == nullptr, "Bundle cleared on insecure");
+
+  // Precedence: setCACert overrides previous setInsecure
+  const char* ca2 = "ROOT_CA_2";
+  client.setCACert(ca2);
+  expectTrue(!NetworkClientSecureStub::isInsecure, "setCACert must clear insecure flag");
+  expectEq(NetworkClientSecureStub::lastCACert, ca2, "New CA cert set");
+
+  // Precedence: setInsecure overrides previous setCACert
+  client.setInsecure();
+  expectTrue(NetworkClientSecureStub::isInsecure, "setInsecure must override previous CA");
+  expectTrue(NetworkClientSecureStub::lastCACert == nullptr, "CA must be cleared");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsReconfigureCallsStopAndLifecycle() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://api.example.com");
+  client.setCACert("INIT_CA");
+
+  HttpClientStub::setResponse(200, "{}");
+  client.get("/1").execute();
+
+  int stops = NetworkClientSecureStub::stopCallCount;
+
+  // Reconfiguring any setter calls stop()
+  client.setCACert("NEW_CA");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setCACert must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setInsecure();
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setInsecure must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setClientCert("C", "K");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setClientCert must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  client.setCACertBundle(nullptr, 0);
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setCACertBundle must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // setBaseUrl calls stop()
+  client.setBaseUrl("https://other.example.com");
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setBaseUrl must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // setPort calls stop()
+  client.setPort(8443);
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "setPort must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // end() calls stop()
+  client.end();
+  expectTrue(NetworkClientSecureStub::stopCallCount > stops, "end() must call stop()");
+  stops = NetworkClientSecureStub::stopCallCount;
+
+  // Reconnecting after end() works seamlessly
+  client.setCACert("RECONNECT_CA");
+  HttpClientStub::setResponse(200, "{\"reconnected\":true}");
+  client.get("/2").execute();
+  expectTrue(HttpClientStub::usedSecureClient, "Must reconnect using secure client after end()");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsRetryReusesSameClient() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://retry.example.com");
+  client.setCACert("CA_RETRY");
+  client.setMaxRetry(1);
+
+  // First attempt fails, second attempt succeeds
+  HttpClientStub::queueResponse(HTTPC_ERROR_CONNECTION_LOST, "");
+  HttpClientStub::queueResponse(200, "{\"success\":true}");
+
+  client.get("/data").execute();
+
+  expectEqInt(client.getStatusCode(), 200, "Request should succeed after retry");
+  expectEqInt(HttpClientStub::requestCount, 2, "Two attempts should have been made");
+  expectTrue(HttpClientStub::usedSecureClient, "Retry must use secure client");
+  expectTrue(HttpClientStub::lastSecureClient != nullptr, "Secure client must not be null");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsProtocolUnification() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  // Test GraphQL via single beginConnection
+  {
+    ESP32HTTPClient client("https://api.example.com");
+    client.setCACert("GRAPHQL_CA");
+    HttpClientStub::setResponse(200, "{\"data\":{\"name\":\"ESP32\"}}");
+    client.graphqlPost("/graphql").query("{ name }").execute();
+    expectTrue(HttpClientStub::usedSecureClient, "GraphQL POST must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "GRAPHQL_CA", "GraphQL CA cert passed");
+  }
+
+  // Test SOAP via single beginConnection
+  {
+    ESP32HTTPClient client("https://soap.example.com");
+    client.setCACert("SOAP_CA");
+    HttpClientStub::setResponse(200, "<soap:Envelope><soap:Body><res>ok</res></soap:Body></soap:Envelope>");
+    client.soap("/service").action("DoWork").execute();
+    expectTrue(HttpClientStub::usedSecureClient, "SOAP must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "SOAP_CA", "SOAP CA cert passed");
+  }
+
+  // Test JSON-RPC via single beginConnection
+  {
+    ESP32HTTPClient client("https://rpc.example.com");
+    client.setCACert("RPC_CA");
+    HttpClientStub::setResponse(200, "{\"jsonrpc\":\"2.0\",\"result\":\"pong\",\"id\":1}");
+    client.jsonRpc("/api").method("ping").id(1).execute();
+    expectTrue(HttpClientStub::usedSecureClient, "JSON-RPC must use unified secure connection");
+    expectEq(NetworkClientSecureStub::lastCACert, "RPC_CA", "JSON-RPC CA cert passed");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
+
+static void testTlsErrorsAndObservability() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+
+  ESP32HTTPClient client("https://fail.example.com");
+  client.setCACert("FAIL_CA");
+
+  // Initial errors are 0 and empty
+  expectEqInt(client.getTlsError(), 0, "Initial TLS error should be 0");
+  expectEq(client.getTlsErrorMessage().c_str(), "", "Initial TLS error message should be empty");
+  expectEq(client.getTlsErrorHint().c_str(), "", "Initial TLS error hint should be empty");
+
+  // Set mock mbedtls error in secure client
+  NetworkClientSecureStub::lastErrorCode = -0x2700;
+  NetworkClientSecureStub::lastErrorMessage = "X509 - Certificate verification failed";
+
+  expectEqInt(client.getTlsError(), -0x2700, "getTlsError returns mbedtls code");
+  expectEq(client.getTlsErrorMessage().c_str(), "X509 - Certificate verification failed", "getTlsErrorMessage returns description");
+
+  // Trigger error flow in HTTPClient
+  HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+  bool errorCbFired = false;
+  int errorCbCode = 0;
+  String errorCbMsg = "";
+  client.onError([&](int code, const char* msg) {
+    errorCbFired = true;
+    errorCbCode = code;
+    errorCbMsg = msg;
+  });
+
+  bool obsFired = false;
+  client.onObservability([&](const ObservabilityMetrics&) {
+    obsFired = true;
+  });
+
+  client.get("/test").execute();
+
+  expectTrue(errorCbFired, "onError callback should be called on connection/handshake failure");
+  expectEqInt(errorCbCode, HTTPC_ERROR_CONNECTION_REFUSED, "Error code should match HTTPClient code");
+  expectTrue(errorCbMsg.indexOf("Connection Refused") >= 0, "Error message should include Connection Refused");
+  expectTrue(errorCbMsg.indexOf("-0x2700") >= 0, "Error message should include mbedTLS hex code");
+  expectTrue(errorCbMsg.indexOf("Hint:") >= 0, "Error message should include diagnostic hint");
+  expectTrue(obsFired, "Observability callback should fire on failure");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+}
+
+static void testTlsDiagnosticHintsAndNtpClock() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+
+  // 0 error code returns empty hint
+  expectEq(ESP32HTTPClient::tlsErrorToHint(0).c_str(), "", "tlsErrorToHint(0) is empty");
+
+  // 0x2700 with unsynchronized clock (< 2023)
+  String ntpHint = ESP32HTTPClient::tlsErrorToHint(-0x2700, 100000L);
+  expectTrue(ntpHint.indexOf("before 2023") >= 0, "0x2700 with old clock mentions before 2023");
+  expectTrue(ntpHint.indexOf("NTP") >= 0, "0x2700 with old clock mentions NTP");
+
+  // 0x2700 with synchronized clock (>= 2023)
+  String certHint = ESP32HTTPClient::tlsErrorToHint(-0x2700, 1700000000L);
+  expectTrue(certHint.indexOf("openssl s_client -showcerts") >= 0, "0x2700 with synced clock mentions openssl s_client");
+
+  // Invalid PEM / X509 format codes
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x2180, 1700000000L).indexOf("BEGIN CERTIFICATE") >= 0, "0x2180 hint mentions PEM format");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x3D00, 1700000000L).indexOf("BEGIN CERTIFICATE") >= 0, "0x3D00 hint mentions PEM format");
+
+  // Heap allocation failure codes
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7F00, 1700000000L).indexOf("client.end()") >= 0, "0x7F00 hint mentions client.end()");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x0010, 1700000000L).indexOf("client.end()") >= 0, "0x0010 hint mentions client.end()");
+
+  // Fatal alert
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7780, 1700000000L).indexOf("Fatal TLS alert") >= 0, "0x7780 hint mentions fatal alert");
+
+  // Peer EOF / close notify
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7280, 1700000000L).indexOf("Peer closed") >= 0, "0x7280 hint mentions peer closed");
+
+  // mTLS client cert required
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x7680, 1700000000L).indexOf("setClientCert") >= 0, "0x7680 hint mentions setClientCert");
+
+  // Network timeout / reset
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6800, 1700000000L).indexOf("setTimeout") >= 0, "0x6800 hint mentions setTimeout");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x004C, 1700000000L).indexOf("setTimeout") >= 0, "0x004C hint mentions setTimeout");
+
+  // TCP connect / DNS failure
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x0042, 1700000000L).indexOf("DNS") >= 0, "0x0042 hint mentions DNS");
+
+  // Generic unknown mbedTLS code with old clock vs synced clock
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6000, 500L).indexOf("before 2023") >= 0, "unknown code with old clock mentions before 2023");
+  expectTrue(ESP32HTTPClient::tlsErrorToHint(-0x6000, 1700000000L).indexOf("TLS handshake failed") >= 0, "unknown code with synced clock mentions TLS handshake failed");
+
+  // Test client-level hint when tlsError == 0, status == -1, and system clock is before 2023
+  {
+    ArduinoStub::mockEpoch = 100L;  // 1970 (no NTP)
+    ESP32HTTPClient client("https://ntp-missing.example.com");
+    client.setCACert("SOME_CA");
+    HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+    client.get("/ping").retry(0).execute();
+
+    String hint = client.getTlsErrorHint();
+    String errMsg = client.getErrorMessage();
+    expectTrue(hint.indexOf("before 2023") >= 0, "getTlsErrorHint detects unsynced clock on HTTPS -1");
+    expectTrue(errMsg.indexOf("before 2023") >= 0, "getErrorMessage includes NTP hint when clock < 2023");
+  }
+
+  // Test client-level hint when tlsError == 0, status == -1, synced clock, and DEFAULT_TLS used
+  {
+    ArduinoStub::mockEpoch = 1700000000L;
+    ESP32HTTPClient client("https://default-tls.example.com");
+    HttpClientStub::setResponse(HTTPC_ERROR_CONNECTION_REFUSED, "");
+    client.get("/ping").retry(0).execute();
+
+    String hint = client.getTlsErrorHint();
+    expectTrue(hint.indexOf("without a configured Root CA") >= 0, "getTlsErrorHint advises configuring Root CA on default TLS failure");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+}
+
+static void testTlsFailClosedAndWarnings() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+
+  expectEq(ESP32HTTPClient::errorToString(HTTPC_ERROR_TLS_NOT_VALIDATED).c_str(),
+           "TLS Validation Required",
+           "errorToString(-12) returns TLS Validation Required");
+
+  // 1. Warning logged when setInsecure() is called and used
+  {
+    ArduinoStub::resetLogs();
+    ESP32HTTPClient client("https://insecure.example.com");
+    expectTrue(!client.isValidatedTlsRequired(), "requireValidatedTls defaults to false");
+    expectTrue(!client.hasValidatedTlsConfig(), "hasValidatedTlsConfig initially false");
+
+    client.setInsecure();
+    expectTrue(ArduinoStub::warningLogCount >= 1, "setInsecure() logs a security warning");
+    expectTrue(ArduinoStub::lastWarningLog.find("setInsecure()") != std::string::npos, "Warning mentions setInsecure()");
+    expectTrue(!client.hasValidatedTlsConfig(), "setInsecure() does not count as validated TLS");
+
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/data").execute();
+    expectTrue(ArduinoStub::warningLogCount >= 2, "Executing HTTPS with setInsecure() logs warning");
+  }
+
+  // 2. Warning logged when DEFAULT_TLS path is used (HTTPS without CA or bundle)
+  {
+    ArduinoStub::resetLogs();
+    ESP32HTTPClient client("https://unconfigured.example.com");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/data").execute();
+    expectTrue(ArduinoStub::warningLogCount >= 1, "HTTPS with DEFAULT_TLS logs a warning");
+    expectTrue(ArduinoStub::lastWarningLog.find("without setCACert()") != std::string::npos, "Warning mentions missing setCACert()");
+  }
+
+  // 3. Fail-closed mode (requireValidatedTls(true)) blocks unconfigured HTTPS
+  {
+    ArduinoStub::resetLogs();
+    HttpClientStub::reset();
+    ESP32HTTPClient client("https://strict.example.com");
+    client.requireValidatedTls(true);
+    expectTrue(client.isValidatedTlsRequired(), "isValidatedTlsRequired() is true");
+
+    bool errCalled = false;
+    int errCode = 0;
+    String errMsg;
+    client.get("/secret")
+          .onError([&](int c, const char* m) {
+            errCalled = true;
+            errCode = c;
+            errMsg = m;
+          })
+          .execute();
+
+    expectEqInt(HttpClientStub::requestCount, 0, "Fail-closed mode must not dispatch network request");
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "Status code is HTTPC_ERROR_TLS_NOT_VALIDATED (-12)");
+    expectTrue(client.hasError(), "hasError() is true when blocked by requireValidatedTls");
+    expectTrue(errCalled, "onError callback fired when blocked by requireValidatedTls");
+    expectEqInt(errCode, HTTPC_ERROR_TLS_NOT_VALIDATED, "onError received -12");
+    expectTrue(errMsg.indexOf("requireValidatedTls(true)") >= 0, "Error message explains requireValidatedTls failure");
+    expectTrue(ArduinoStub::errorLogCount >= 1, "Error log emitted on fail-closed refusal");
+  }
+
+  // 4. Fail-closed mode also blocks setInsecure(), SOAP, GraphQL, and JSON-RPC without CA
+  {
+    ArduinoStub::resetLogs();
+    HttpClientStub::reset();
+    ESP32HTTPClient client("https://strict.example.com");
+    client.requireValidatedTls(true);
+    client.setInsecure();
+
+    client.get("/rest").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "setInsecure() blocked by requireValidatedTls on REST");
+    expectTrue(client.getTlsErrorHint().indexOf("setInsecure() is not allowed") >= 0, "Hint explains setInsecure is not allowed");
+
+    client.soap("/ws").action("Act").body("<x/>").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "SOAP blocked by requireValidatedTls");
+
+    client.graphql("/graphql").query("{ ping }").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "GraphQL blocked by requireValidatedTls");
+
+    client.jsonRpc("/rpc").method("ping").execute();
+    expectEqInt(client.getStatusCode(), HTTPC_ERROR_TLS_NOT_VALIDATED, "JSON-RPC blocked by requireValidatedTls");
+    expectEqInt(HttpClientStub::requestCount, 0, "Zero network requests sent across all protocols when blocked");
+
+    // Once a valid CA or bundle is configured, requests succeed!
+    client.setCACert("-----BEGIN CERTIFICATE-----\nVALID\n-----END CERTIFICATE-----\n");
+    expectTrue(client.hasValidatedTlsConfig(), "hasValidatedTlsConfig() is true after setCACert");
+    HttpClientStub::setResponse(200, "{\"ok\":true}");
+    client.get("/rest").execute();
+    expectEqInt(client.getStatusCode(), 200, "HTTPS succeeds in fail-closed mode after setCACert");
+
+    const uint8_t bundle[] = {0x01, 0x02};
+    client.setCACertBundle(bundle, sizeof(bundle));
+    expectTrue(client.hasValidatedTlsConfig(), "hasValidatedTlsConfig() is true after setCACertBundle");
+    client.get("/rest2").execute();
+    expectEqInt(client.getStatusCode(), 200, "HTTPS succeeds in fail-closed mode after setCACertBundle");
+  }
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+  ArduinoStub::resetLogs();
+}
+
+static void testTlsKeepAliveSessionReuse() {
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+
+  ESP32HTTPClient client("https://keepalive.example.com");
+  client.setCACert("KEEPALIVE_CA");
+
+  HttpClientStub::setResponse(200, "{\"r\":1}");
+  client.get("/one").execute();
+  void* client1 = HttpClientStub::lastSecureClient;
+  int stops1 = NetworkClientSecureStub::stopCallCount;
+
+  HttpClientStub::setResponse(200, "{\"r\":2}");
+  client.get("/two").execute();
+  void* client2 = HttpClientStub::lastSecureClient;
+  int stops2 = NetworkClientSecureStub::stopCallCount;
+
+  expectTrue(client1 != nullptr, "Client 1 must be non-null");
+  expectTrue(client1 == client2, "Persistent TLS session must reuse the same client pointer");
+  expectEqInt(stops1, stops2, "Keep-Alive requests must not stop client between requests");
+
+  HttpClientStub::reset();
+  NetworkClientSecureStub::reset();
+}
 
 }
 
@@ -1967,6 +2450,16 @@ int main() {
   runSuite("SkipValueEscapedString", testSkipValueEscapedString);
   runSuite("ObjectWithNestedArrayChildBinding", testObjectWithNestedArrayChildBinding);
   runSuite("BufferedStreamReaderDirect", testBufferedStreamReaderDirect);
+  runSuite("TlsDefaultBehavior", testTlsDefaultBehavior);
+  runSuite("TlsSettersAndSecureInjection", testTlsSettersAndSecureInjection);
+  runSuite("TlsAllSettersRepassValues", testTlsAllSettersRepassValues);
+  runSuite("TlsReconfigureCallsStopAndLifecycle", testTlsReconfigureCallsStopAndLifecycle);
+  runSuite("TlsRetryReusesSameClient", testTlsRetryReusesSameClient);
+  runSuite("TlsProtocolUnification", testTlsProtocolUnification);
+  runSuite("TlsErrorsAndObservability", testTlsErrorsAndObservability);
+  runSuite("TlsDiagnosticHintsAndNtpClock", testTlsDiagnosticHintsAndNtpClock);
+  runSuite("TlsFailClosedAndWarnings", testTlsFailClosedAndWarnings);
+  runSuite("TlsKeepAliveSessionReuse", testTlsKeepAliveSessionReuse);
 
   const int suitesFailed = suitesRun - suitesPassed;
   const double suitePassRate = suitesRun > 0 ? (100.0 * static_cast<double>(suitesPassed) / static_cast<double>(suitesRun)) : 0.0;

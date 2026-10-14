@@ -122,6 +122,7 @@ Stream responses into your variables and keep request code short.
 - **Native JSON-RPC 2.0 support** — positional and named parameters, configurable request IDs, notifications, struct serialization/binding, and standard error handling.
 - **Native SOAP 1.1 & 1.2 support** — automatic envelopes, SOAPAction/Content-Type headers, streaming XML response parsing, and SOAP Fault handling.
 - **Struct <-> JSON mapping** — direct bidirectional struct serialization/deserialization without dynamic document allocations.
+- **Comprehensive TLS / HTTPS Support** — Root CA validation (`setCACert`), X.509 certificate bundles (`setCACertBundle`), mutual TLS (`setClientCert`), and opt-in insecure mode (`setInsecure`). Zero TLS heap overhead on HTTP, native Keep-Alive TLS session reuse, and granular mbedTLS error reporting (`getTlsError`). Fully compatible with `arduino-esp32` 2.x and 3.x.
 - **Full REST support** — `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` are all first-class citizens.
 - **IoT ready** — designed for connecting ESP32 devices to cloud backends, Firebase, AWS API Gateway, GraphQL endpoints, SOAP web services, or custom servers.
 
@@ -369,6 +370,64 @@ To manually close the connection and free this memory when you are done making r
 client.end(); // Closes the connection and frees TLS RAM
 ```
 
+### TLS / HTTPS Configuration & Security
+
+The library supports robust TLS/HTTPS with certificate validation, client certificates (mTLS), custom CA bundles, fail-closed enforcement, and actionable mbedTLS diagnostics:
+
+```cpp
+// 1. Root CA Certificate Validation (PEM format)
+// Pointers are stored, not copied: buffer must remain in memory (static/const/PROGMEM)
+static const char* root_ca = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+client.setCACert(root_ca);
+
+// 2. Certificate Bundle (ESP-IDF esp_crt_bundle format)
+// client.setCACertBundle(bundle_data, bundle_size);
+
+// 3. Fail-Closed Mode: refuse HTTPS if neither setCACert() nor setCACertBundle() is configured
+// (Can also be enabled globally via build flag: -DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1)
+client.requireValidatedTls(true);
+
+// 4. Mutual TLS (mTLS) Client Certificate & Private Key
+// client.setClientCert(client_cert_pem, client_key_pem);
+
+// 5. Insecure Mode (WARNING: Disables certificate and hostname validation! Logs a security warning)
+// client.setInsecure();
+
+// 6. Inspect mbedTLS error and actionable diagnostic hint on failure
+if (client.hasError()) {
+    // getErrorMessage() automatically includes the mbedTLS code + hint (e.g., clock before 2023 / NTP,
+    // expired certificate, wrong Root CA, or hostname mismatch)
+    Serial.printf("Request Error (%d): %s\n",
+                  client.getStatusCode(), client.getErrorMessage().c_str());
+
+    if (client.getTlsError() != 0) {
+        Serial.printf("TLS Hint: %s\n", client.getTlsErrorHint().c_str());
+    }
+}
+```
+
+#### Practical TLS Security Guide
+
+1. **How to obtain the right Root CA (`openssl s_client`)**:
+   Do **not** pin the server's leaf certificate (it rotates every 60–90 days). Instead, inspect the full certificate chain presented by the server and extract the **Root CA** (the issuer of the last certificate in the chain):
+   ```bash
+   openssl s_client -showcerts -servername api.example.com -connect api.example.com:443 </dev/null
+   ```
+   Copy the root certificate PEM block (`-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----`) or download the corresponding Root CA PEM from the CA's official repository (e.g., ISRG Root X1 for Let's Encrypt, DigiCert Global Root G2, Amazon Root CA 1).
+
+2. **Single Root CA (`setCACert`) vs. Certificate Bundle (`setCACertBundle`)**:
+   - **Single Root CA (`setCACert`)**: Best when connecting to a single backend or cloud provider whose PKI you control or know in advance. Uses minimal Flash (~1.5–2 KB per PEM) and zero extra build configuration.
+   - **CA Bundle (`setCACertBundle`)**: Best when connecting to arbitrary user-configured URLs, third-party webhooks, or CDNs (like Cloudflare) that may switch between different Certificate Authorities (Let's Encrypt, Google Trust Services, DigiCert). Costs ~25–65 KB of Flash.
+
+3. **Certificate & Root CA Expiration (Firmware Updates / OTA)**:
+   - **Leaf certificates** expire frequently (e.g., Let's Encrypt every 90 days) — pinning a Root CA handles leaf renewals automatically without firmware changes.
+   - **Root CAs also expire** (typically 5–20 years) or can be cross-signed/revoked, and servers may migrate to a different CA. **Always include an OTA (Over-The-Air) firmware update mechanism** (or load CA certificates from LittleFS/NVS) in production devices so you can rotate trust anchors before they expire.
+
+> [!IMPORTANT]
+> **NTP Synchronization:** TLS certificate validation requires an accurate system clock to verify certificate validity dates (`notBefore` and `notAfter`). If the ESP32 clock defaults to 1970, validation **will fail** (and `getTlsErrorHint()` / `getErrorMessage()` will explicitly warn that the system clock is before 2023). Synchronize time via NTP using `configTime(0, 0, "pool.ntp.org")` before making validated HTTPS requests. See [`examples/HttpsTls`](examples/HttpsTls/HttpsTls.ino).
+
+
+
 ### Authentication Helpers
 
 Easily authenticate requests using built-in helpers for Bearer tokens, Basic Auth, or API keys:
@@ -522,6 +581,7 @@ Runnable sketches are available in the `examples/` directory:
 | [ArrayJSON](examples/ArrayJSON/ArrayJSON.ino) | Addressing array elements by index. |
 | [RawArrayJSON](examples/RawArrayJSON/RawArrayJSON.ino) | Capturing raw arrays or objects into Arduino Strings. |
 | [UnixTimestamp](examples/UnixTimestamp/UnixTimestamp.ino) | Fetching the current Unix Timestamp from an API. |
+| [HttpsTls](examples/HttpsTls/HttpsTls.ino) | TLS / HTTPS requests with Root CA certificate validation, NTP time sync, session reuse, and insecure mode. |
 
 ## API Reference
 
@@ -568,10 +628,21 @@ Each method returns a `RestRequest` that can be chained with `.query()`, `.body(
 | `setTimeout(timeoutMs)` | Sets default request timeout in milliseconds (default: 60000, 1 min). | `client.setTimeout(10000);` |
 | `setMaxRetry(maxRetry)` | Sets default max retries on network failure (default: 1). | `client.setMaxRetry(3);` |
 | `setContentType(contentType)` | Overrides the `Content-Type` header used for request bodies. Defaults to `application/json`. | `client.setContentType("application/x-www-form-urlencoded");` |
+| `setCACert(rootCA)` | Configures Root CA certificate in PEM format for TLS validation (stored by pointer). | `client.setCACert(root_ca);` |
+| `setCACertBundle(bundle, size)` | Configures an X.509 certificate bundle (ESP-IDF format). | `client.setCACertBundle(bundle);` |
+| `setClientCert(cert, key)` | Configures client certificate and private key for mutual TLS (mTLS). | `client.setClientCert(cert, key);` |
+| `setInsecure()` | Disables TLS certificate and hostname validation (logs a warning; use only for testing). | `client.setInsecure();` |
+| `requireValidatedTls(require)` | Enables/disables fail-closed mode: refuses HTTPS requests (`-12`) unless a Root CA or CA bundle is configured. | `client.requireValidatedTls(true);` |
+| `isValidatedTlsRequired()` | Returns `true` if fail-closed TLS validation mode is active. | `bool req = client.isValidatedTlsRequired();` |
+| `hasValidatedTlsConfig()` | Returns `true` if a non-empty Root CA or CA bundle is configured and `setInsecure()` is not active. | `if (client.hasValidatedTlsConfig()) { ... }` |
+| `getTlsError()` | Returns last mbedTLS error code (`int`), or `0` if none. | `int err = client.getTlsError();` |
+| `getTlsErrorMessage()` | Returns descriptive message and hex code for last mbedTLS error. | `String msg = client.getTlsErrorMessage();` |
+| `getTlsErrorHint()` | Returns actionable troubleshooting hint for last TLS failure (checks NTP clock `< 2023`, CA, expiry, hostname). | `String hint = client.getTlsErrorHint();` |
+| `tlsErrorToHint(err, epoch)` | Static helper mapping an mbedTLS error code and Unix epoch to an actionable hint. | `String h = ESP32HTTPClient::tlsErrorToHint(err);` |
 | `getStatusCode()` | Returns the HTTP status code of the last completed request. | `int code = client.getStatusCode();` |
 | `isSuccess()` | Returns `true` if last request status was 2xx (`200 <= code < 300`). | `if (client.isSuccess()) { ... }` |
 | `hasError()` | Returns `true` if last request had network error or HTTP error (`code >= 400`). | `if (client.hasError()) { ... }` |
-| `getErrorMessage()` | Returns descriptive error string for last status or error code. | `String err = client.getErrorMessage();` |
+| `getErrorMessage()` | Returns descriptive error string (enriched with mbedTLS code and diagnostic hint on TLS failures). | `String err = client.getErrorMessage();` |
 | `onSuccess(cb)` | Registers client-level callback for successful requests (2xx). | `client.onSuccess([](int code){ ... });` |
 | `onError(cb)` | Registers client-level callback for failed requests. | `client.onError([](int code, const char* msg){ ... });` |
 | `onResponse(cb)` | Registers client-level callback executed on every completed request. | `client.onResponse([](int code){ ... });` |
@@ -695,6 +766,7 @@ Inspect the last request with `getStatusCode()`, `isSuccess()`, `hasError()`, or
 | `-9` | Encoding Error | Client error |
 | `-10` | Stream Write Error | Client error |
 | `-11` | Read Timeout | Client error |
+| `-12` | TLS Validation Required | Client error (fail-closed TLS) |
 | `200` | OK | HTTP success |
 | `201` | Created | HTTP success |
 | `202` | Accepted | HTTP success |

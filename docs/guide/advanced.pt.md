@@ -225,6 +225,7 @@ if (client.isSuccess()) {
 | `-9` | `HTTPC_ERROR_ENCODING` | Erro de codificação ou decodificação de transferência. |
 | `-10` | `HTTPC_ERROR_STREAM_WRITE` | Falha na operação de escrita no stream. |
 | `-11` | `HTTPC_ERROR_READ_TIMEOUT` | Tempo limite esgotado aguardando resposta do servidor. |
+| `-12` | `HTTPC_ERROR_TLS_NOT_VALIDATED` | Requisição HTTPS recusada pelo modo fail-closed (`requireValidatedTls`) por ausência de Root CA ou CA bundle. |
 
 #### Códigos de Status HTTP (`code > 0`)
 
@@ -376,3 +377,126 @@ User parsedUser;
 ESP32HTTPClient::fromJson(jsonStr, &parsedUser);
 // Ou: RestJson::fromJson(jsonStr, &parsedUser);
 ```
+
+---
+
+## Segurança e Certificados TLS / HTTPS
+
+O `ESP32HTTPClient` inclui suporte integrado a conexões criptografadas HTTPS com validação de certificados X.509, autenticação mútua com certificados de cliente (mTLS), bundles de certificados, modo "falhar fechado" (*fail-closed*) e diagnóstico detalhado de erros do mbedTLS.
+
+### Como Obter a CA Raiz Correta (`openssl s_client`)
+
+**Não** fixe o certificado folha (*leaf certificate*) do servidor no firmware — certificados de servidor expiram a cada 60 a 90 dias (ex.: Let's Encrypt), o que faria seus dispositivos pararem de conectar assim que o servidor renovasse o certificado. Em vez disso, fixe sempre a **CA Raiz (Root CA)** no topo da cadeia de certificação.
+
+Execute o comando `openssl s_client` no seu computador para inspecionar a cadeia completa de certificados apresentada pelo servidor:
+
+```bash
+openssl s_client -showcerts -servername api.exemplo.com -connect api.exemplo.com:443 </dev/null
+```
+
+Observe o **último certificado** listado na saída (ou verifique o campo `i:` / `Issuer` do certificado intermediário). Copie o bloco PEM da CA Raiz (`-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----`), ou baixe o PEM oficial no repositório da Autoridade Certificadora correspondente (ex.: **ISRG Root X1** para Let's Encrypt, **DigiCert Global Root G2** ou **Amazon Root CA 1**).
+
+### Quando Usar Raiz Única (`setCACert`) vs. Bundle de Certificados (`setCACertBundle`)
+
+| Abordagem | API | Custo de Flash | Quando Utilizar |
+| :--- | :--- | :--- | :--- |
+| **CA Raiz Única** | `client.setCACert(root_ca_pem)` | **~1,5 – 2 KB** por PEM | **Recomendado para dispositivos IoT com backend fixo.** Ideal quando o ESP32 se comunica com uma API própria ou provedor cloud específico cuja PKI você conhece ou controla. |
+| **Bundle de CAs** | `client.setCACertBundle(bundle, size)` | **~25 – 65 KB** | **Recomendado para múltiplos domínios ou URLs configuráveis.** Ideal quando o dispositivo acessa webhooks arbitrários, APIs de terceiros ou CDNs (como Cloudflare e CloudFront) que podem alternar automaticamente entre diferentes Autoridades Certificadoras (Let's Encrypt, Google Trust Services, DigiCert). |
+
+### Expiração de Certificados e CAs Raízes (Atualização de Firmware / OTA)
+
+- **Certificados do Servidor (Folha)**: São renovados com frequência (60–90 dias). Como o ESP32 valida a assinatura usando a **CA Raiz**, renovações normais do certificado do servidor **não exigem atualização de firmware**.
+- **Certificados de CA Raiz**: CAs raízes possuem validade longa (tipicamente 5 a 20 anos), mas **também expiram**, podem ser revogadas ou o provedor de nuvem pode migrar para uma nova hierarquia de CA (como ocorreu na transição do *DST Root CA X3* para *ISRG Root X1*, ou do *Baltimore CyberTrust Root* para *DigiCert Global Root G2*).
+- **Estratégia para Produção**: Nunca envie dispositivos conectados via HTTPS para o campo sem um mecanismo de **atualização de firmware OTA (Over-The-Air)** — ou armazene os certificados CA em uma partição atualizável (como LittleFS ou NVS) — garantindo que você possa atualizar as âncoras de confiança antes que expirem.
+
+### Tempo de Vida dos Buffers (Semântica de Ponteiros)
+
+Certificados e chaves privadas são armazenados por **ponteiro** no `ESP32HTTPClient`. Nenhuma cópia dinâmica é criada na heap. Portanto, garanta que os buffers permaneçam válidos na memória enquanto o cliente existir:
+
+```cpp
+// Armazenado como constante estática global ou em PROGMEM
+static const char* isrg_root_ca =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIFazCCA1OgAwIBAgIRAIIQz7urnIjMvluidIT5FsAwDQYJKoZIhvcNAQELBQAw\n"
+    "...\n"
+    "-----END CERTIFICATE-----\n";
+
+void setup() {
+    client.setCACert(isrg_root_ca);
+}
+```
+
+### Modo "Falhar Fechado" (`requireValidatedTls`) e Avisos de Segurança
+
+Por padrão, se uma requisição `https://` for iniciada sem configurar `setCACert()` ou `setCACertBundle()`, ou quando `setInsecure()` for chamado, o `ESP32HTTPClient` emite um log de aviso (`ESP32HTTPCLIENT_LOG_W` / `log_w`) alertando que a conexão TLS não possui validação de certificado configurada.
+
+Para ativar o modo **falhar fechado** (*fail-closed*) em produção — recusando conexões HTTPS caso alguém esqueça de configurar a CA/bundle ou deixe `setInsecure()` ativo acidentalmente — habilite `requireValidatedTls(true)`:
+
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(isrg_root_ca); // Se omitido, requisições HTTPS falham imediatamente com -12
+```
+
+Você também pode exigir TLS validado globalmente em tempo de compilação para todas as instâncias de `ESP32HTTPClient` via `platformio.ini`:
+
+```ini
+build_flags =
+    -DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1
+```
+
+Quando o modo *fail-closed* bloqueia uma conexão HTTPS sem validação, nenhum socket de rede é aberto e a requisição retorna imediatamente o código `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
+### Sincronização Obrigatória de Relógio via NTP
+
+Cadeias de certificados TLS validam datas de emissão e expiração (`Not Before` e `Not After`). Como a placa ESP32 não possui RTC alimentado por bateria, seu relógio inicia no Unix epoch 0 (1 de janeiro de 1970) após a inicialização. Sem sincronização de relógio, o stack mbedTLS rejeitará certificados modernos por data inválida (`MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`, `-0x2700`).
+
+Sempre sincronize a data/hora logo após a conexão WiFi:
+
+```cpp
+configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+time_t now = time(nullptr);
+while (now < 1672531200) { // 1 de janeiro de 2023
+    delay(500);
+    now = time(nullptr);
+}
+```
+
+### Diagnóstico Prático de Erros TLS (`getTlsErrorHint`)
+
+Quando o handshake TLS falha, receber apenas `"Connection Refused"` (`-1`) dificulta descobrir a causa real. O `ESP32HTTPClient` enriquece automaticamente `client.getErrorMessage()` com o código hexadecimal do mbedTLS e uma dica prática de solução, além de disponibilizar `client.getTlsErrorHint()` (e o método estático `ESP32HTTPClient::tlsErrorToHint(tlsError, currentEpoch)`):
+
+| Causa Real Comum | Código(s) mbedTLS | Dica de Diagnóstico Retornada |
+| :--- | :--- | :--- |
+| **Relógio sem NTP (antes de 2023)** | `-0x2700` (com relógio `< 2023`) | A hora do sistema está antes de 2023 (não sincronizada via NTP); chame `configTime(0, 0, "pool.ntp.org")` antes de iniciar requisições HTTPS. |
+| **CA errada / Certificado expirado / Hostname divergente** | `-0x2700` (`X509_CERT_VERIFY_FAILED`) | Falha na verificação X.509: confira se a Root CA corresponde à cadeia do servidor (`openssl s_client -showcerts`), se o certificado não expirou e se o hostname na URL coincide com o CN/SAN. |
+| **Formato PEM / DER inválido** | `-0x2180` .. `-0x3E80` | Formato de certificado/chave inválido: verifique os delimitadores `-----BEGIN/END CERTIFICATE-----`, quebras de linha `\n` e se o ponteiro permanece válido na memória. |
+| **Memória RAM (Heap) insuficiente** | `-0x7F00`, `-0x2880`, `-0x0010` | Falta de memória heap durante o handshake TLS (~45 KB livres necessários). Chame `client.end()` em clientes ociosos. |
+| **Alerta Fatal / mTLS exigido** | `-0x7780` (`SSL_FATAL_ALERT_MESSAGE`) | O servidor rejeitou o handshake com alerta fatal (verifique se o servidor exige certificado de cliente mTLS via `setClientCert()`, SNI ou cifra compatível). |
+| **SNI / Certificado ausente** | `-0x7280`, `-0x7880`, `-0x7100`, `-0x7680` | Falha na negociação do handshake ou nenhum certificado correspondeu ao hostname solicitado (SNI). |
+
+```cpp
+client.get("/todos/1");
+if (client.hasError()) {
+    // Exibe o erro completo + código mbedTLS + dica prática de diagnóstico
+    Serial.printf("Erro (%d): %s\n",
+                  client.getStatusCode(), client.getErrorMessage().c_str());
+
+    if (client.getTlsError() != 0) {
+        Serial.printf("Código TLS: -0x%04X | Dica: %s\n",
+                      -client.getTlsError(), client.getTlsErrorHint().c_str());
+    }
+}
+```
+
+### Modo Inseguro (Apenas para Desenvolvimento)
+
+Para desenvolvimento em rede local ou testes com certificados autoassinados, a validação de certificados pode ser desativada explicitamente (desde que `requireValidatedTls(true)` não esteja ativo):
+
+```cpp
+client.setInsecure();
+```
+
+!!! warning "Risco de Segurança"
+    `setInsecure()` emite um log de aviso e desativa totalmente a validação do certificado e do hostname, tornando as conexões vulneráveis a ataques Man-in-the-Middle (MITM). Nunca utilize `setInsecure()` em ambientes de produção.
+
+

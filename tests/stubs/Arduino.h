@@ -241,4 +241,39 @@ public:
 };
 inline ESPClass ESP;
 
+namespace ArduinoStub {
+inline int warningLogCount = 0;
+inline int errorLogCount = 0;
+inline std::string lastWarningLog = "";
+inline std::string lastErrorLog = "";
+inline long mockEpoch = 1700000000L;  // Default: synced clock (>= 2023)
+
+inline void resetLogs() {
+  warningLogCount = 0;
+  errorLogCount = 0;
+  lastWarningLog.clear();
+  lastErrorLog.clear();
+  mockEpoch = 1700000000L;
+}
+
+inline void logWarn(const char* fmt) {
+  warningLogCount++;
+  lastWarningLog = fmt ? fmt : "";
+}
+
+inline void logErr(const char* fmt) {
+  errorLogCount++;
+  lastErrorLog = fmt ? fmt : "";
+}
+
+inline long getMockEpoch() {
+  return mockEpoch;
+}
+}  // namespace ArduinoStub
+
+#define log_w(fmt, ...) ArduinoStub::logWarn(fmt)
+#define log_e(fmt, ...) ArduinoStub::logErr(fmt)
+#define ESP32HTTPCLIENT_CUSTOM_EPOCH_FN ArduinoStub::getMockEpoch
+
 #endif
+

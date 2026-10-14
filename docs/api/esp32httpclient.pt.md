@@ -463,6 +463,187 @@ client.setContentType("application/x-www-form-urlencoded");
 
 ---
 
+## Configuração TLS / HTTPS
+
+A biblioteca oferece suporte completo a conexões seguras TLS/HTTPS através do mbedTLS nativo do ESP32 (`NetworkClientSecure` no core 3.x, `WiFiClientSecure` no core 2.x).
+
+> [!IMPORTANT]
+> **Semântica de Ponteiros:** Certificados e chaves privadas são armazenados como **ponteiros** (não são copiados para a memória interna). Os buffers DEVEM permanecer válidos durante todo o ciclo de vida da instância `ESP32HTTPClient` (ex.: declarados como `static const char*`, constantes globais ou alocados em PROGMEM).
+>
+> **Sincronização de Relógio via NTP:** A validação do certificado TLS confere as datas de validade (`notBefore` e `notAfter`). Se o relógio interno do ESP32 não estiver sincronizado via NTP (iniciando em 1970 por padrão), a validação **falhará**. Sincronize a hora usando `configTime(0, 0, "pool.ntp.org")` logo após conectar ao WiFi.
+>
+> **Consumo de Memória (Heap):** Conexões TLS alocam buffers do mbedTLS (~45 KB de heap) sob demanda durante o primeiro handshake. Requisições `http://` puras ou clientes sem TLS configurado não sofrem nenhum impacto na memória RAM. Chame `client.end()` para fechar o socket e liberar imediatamente os buffers TLS.
+
+---
+
+### `setCACert(rootCA)`
+
+Configura o certificado da CA raiz (Root CA) em formato PEM para validar a cadeia de certificados do servidor.
+
+```cpp
+void setCACert(const char* rootCA);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `rootCA` | `const char*` | String terminada em nulo contendo o certificado da CA raiz em formato PEM (`"-----BEGIN CERTIFICATE-----\n..."`). O ponteiro é mantido, sem cópia. |
+
+**Exemplo:**
+```cpp
+static const char* isrg_root_x1 = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+client.setCACert(isrg_root_x1);
+```
+
+---
+
+### `setCACertBundle(bundle, size)`
+
+Configura um bundle de certificados X.509 (formato do `esp_crt_bundle` do ESP-IDF).
+
+```cpp
+void setCACertBundle(const uint8_t* bundle, size_t size = 0);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `bundle` | `const uint8_t*` | Ponteiro para os dados binários do bundle de certificados. |
+| `size` | `size_t` | Tamanho opcional do buffer do bundle em bytes (utilizado no arduino-esp32 >= 3.0.4). |
+
+---
+
+### `setClientCert(cert, key)`
+
+Configura o certificado e a chave privada do cliente para autenticação mútua TLS (mTLS).
+
+```cpp
+void setClientCert(const char* cert, const char* key);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `cert` | `const char*` | Certificado do cliente em formato PEM. Mantido por ponteiro. |
+| `key` | `const char*` | Chave privada do cliente em formato PEM. Mantido por ponteiro. |
+
+---
+
+### `setInsecure()`
+
+Desativa explicitamente a validação do certificado do servidor e do hostname, emitindo um log de aviso de segurança (`log_w`).
+
+> [!WARNING]
+> Chamar `setInsecure()` desativa a validação TLS e deixa a comunicação vulnerável a ataques do tipo Man-in-the-Middle (MITM). Use esta opção apenas em ambiente local de desenvolvimento, testes ou certificados autoassinados onde a validação não for viável. Caso `requireValidatedTls(true)` esteja ativo, conexões HTTPS serão recusadas (`-12`) mesmo que `setInsecure()` tenha sido chamado.
+
+```cpp
+void setInsecure();
+```
+
+---
+
+### `requireValidatedTls(require)`
+
+Ativa ou desativa o **modo "falhar fechado" (*fail-closed*)** para conexões TLS. Quando ativado (`true`), qualquer requisição `https://` sem uma CA Raiz (`setCACert`) ou bundle (`setCACertBundle`) configurado — ou com `setInsecure()` ativo — é recusada imediatamente antes de abrir o socket e retorna o código `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
+Também pode ser habilitado globalmente em tempo de compilação com a flag `-DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1`.
+
+```cpp
+void requireValidatedTls(bool require = true);
+```
+
+**Parâmetros:**
+
+| Parâmetro | Tipo | Descrição |
+| :--- | :--- | :--- |
+| `require` | `bool` | `true` (padrão) para exigir validação de certificado em todas as requisições `https://`; `false` para permitir fallback com log de aviso. |
+
+**Exemplo:**
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(root_ca_pem);
+```
+
+---
+
+### `isValidatedTlsRequired()`
+
+Retorna `true` se o modo *fail-closed* de validação TLS estiver ativo nesta instância do cliente.
+
+```cpp
+bool isValidatedTlsRequired() const;
+```
+
+---
+
+### `hasValidatedTlsConfig()`
+
+Retorna `true` se houver uma CA Raiz (`setCACert`) ou bundle (`setCACertBundle`) não-vazio configurado e `setInsecure()` não estiver ativo.
+
+```cpp
+bool hasValidatedTlsConfig() const;
+```
+
+---
+
+### `end()`
+
+Encerra a conexão ativa e libera os recursos associados. Para conexões TLS, fecha o socket seguro e libera os buffers internos do mbedTLS (~45 KB). O cliente continua funcional e pode abrir uma nova conexão na próxima requisição.
+
+```cpp
+void end();
+```
+
+---
+
+### `getTlsError()`
+
+Retorna o código de erro subjacente do mbedTLS (`int`) do último handshake ou tentativa de conexão TLS (valores negativos como `MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`). Retorna `0` se não houver erro de TLS.
+
+```cpp
+int getTlsError() const;
+```
+
+---
+
+### `getTlsErrorMessage()`
+
+Retorna uma mensagem legível com a descrição e representação hexadecimal do último erro de mbedTLS.
+
+```cpp
+String getTlsErrorMessage() const;
+```
+
+---
+
+### `getTlsErrorHint()`
+
+Retorna uma dica prática de diagnóstico para a última falha de handshake TLS (ou bloqueio *fail-closed*), inspecionando o código mbedTLS e o relógio do sistema (`time(nullptr)`). Por exemplo, se a hora do sistema estiver antes de 2023, orienta sincronizar via NTP (`configTime()`). Retorna `""` caso nenhuma dica se aplique.
+
+```cpp
+String getTlsErrorHint() const;
+```
+
+**Exemplo:**
+```cpp
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("Dica TLS: %s\n", client.getTlsErrorHint().c_str());
+}
+```
+
+---
+
+### `tlsErrorToHint(tlsError, currentEpoch)`
+
+Método estático auxiliar que mapeia um código de erro do mbedTLS (e um timestamp Unix opcional `currentEpoch`; passe `-1` para consultar `time(nullptr)` automaticamente) para uma dica prática de solução.
+
+```cpp
+static String tlsErrorToHint(int tlsError, long currentEpoch = -1);
+```
+
 ## Inspeção de Resposta e Tratamento de Erros
 
 ---
@@ -523,7 +704,7 @@ if (client.hasError()) {
 
 ### `getErrorMessage()`
 
-Retorna uma descrição legível do último código de status ou de erro retornado.
+Retorna uma descrição legível do último código de status ou de erro retornado. Quando uma requisição HTTPS falha com código negativo, `getErrorMessage()` anexa automaticamente a descrição e o código hexadecimal do mbedTLS junto com a dica prática de diagnóstico (`getTlsErrorHint()`).
 
 ```cpp
 String getErrorMessage() const;
@@ -713,6 +894,7 @@ client.get("/data3").getBody("v", &v3); // reconecta automaticamente
 | `-9` | Erro de Codificação | Erro do cliente |
 | `-10` | Erro de Escrita no Stream | Erro do cliente |
 | `-11` | Tempo Limite de Leitura | Erro do cliente |
+| `-12` | Validação TLS Obrigatória (`TLS Validation Required`) | Erro do cliente (TLS fail-closed) |
 | `200` | OK | Sucesso HTTP |
 | `201` | Criado | Sucesso HTTP |
 | `202` | Aceito | Sucesso HTTP |

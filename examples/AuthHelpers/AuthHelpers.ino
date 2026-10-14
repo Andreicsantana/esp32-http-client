@@ -5,6 +5,8 @@
 const char* ssid = "YOUR_SSID";
 const char* password = "YOUR_PASSWORD";
 
+// Note: Calling https:// without setCACert() or setInsecure() maintains the ESP32 core's
+// default HTTPClient behavior for retrocompatibility. See examples/HttpsTls/ for validated TLS.
 ESP32HTTPClient client("https://httpbin.org");
 
 void setup() {

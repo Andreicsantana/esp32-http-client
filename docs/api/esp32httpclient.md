@@ -463,6 +463,187 @@ client.setContentType("application/x-www-form-urlencoded");
 
 ---
 
+## TLS / HTTPS Configuration
+
+The library provides robust TLS/HTTPS support powered by the underlying ESP32 mbedTLS stack (`NetworkClientSecure` on core 3.x, `WiFiClientSecure` on core 2.x).
+
+> [!IMPORTANT]
+> **Pointer Lifetime Semantics:** Certificates and keys are stored as **pointers**, not copied into internal memory. The buffers MUST remain valid for the entire lifetime of the `ESP32HTTPClient` instance (e.g., declared as `static const char*`, global constants, or stored in PROGMEM).
+>
+> **NTP Time Synchronization:** TLS certificate validation verifies the certificate's validity period (`notBefore` and `notAfter`). If the system clock is not synchronized via NTP (defaulting to Unix epoch 0 in 1970), certificate validation **will fail**. Synchronize time using `configTime(0, 0, "pool.ntp.org")` after WiFi connects.
+>
+> **Memory Impact:** TLS connections allocate mbedTLS buffers (~45 KB of heap) on demand during the first handshake. Plain `http://` requests or unconfigured clients incur zero TLS heap overhead. Call `client.end()` when done to immediately close the socket and free mbedTLS buffers.
+
+---
+
+### `setCACert(rootCA)`
+
+Configures a custom root CA certificate in PEM format for validating the server's certificate chain.
+
+```cpp
+void setCACert(const char* rootCA);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `rootCA` | `const char*` | Null-terminated string containing the Root CA certificate in PEM format (`"-----BEGIN CERTIFICATE-----\n..."`). Pointer is stored, not copied. |
+
+**Example:**
+```cpp
+static const char* isrg_root_x1 = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n";
+client.setCACert(isrg_root_x1);
+```
+
+---
+
+### `setCACertBundle(bundle, size)`
+
+Configures an X.509 certificate bundle (ESP-IDF `esp_crt_bundle` format).
+
+```cpp
+void setCACertBundle(const uint8_t* bundle, size_t size = 0);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `bundle` | `const uint8_t*` | Pointer to the certificate bundle data. |
+| `size` | `size_t` | Optional size of the bundle buffer in bytes (used in arduino-esp32 >= 3.0.4). |
+
+---
+
+### `setClientCert(cert, key)`
+
+Configures mutual TLS (mTLS) client certificate and private key.
+
+```cpp
+void setClientCert(const char* cert, const char* key);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `cert` | `const char*` | Client certificate in PEM format. Stored by pointer. |
+| `key` | `const char*` | Client private key in PEM format. Stored by pointer. |
+
+---
+
+### `setInsecure()`
+
+Explicitly disables server certificate and hostname verification, and emits a security warning log (`log_w`).
+
+> [!WARNING]
+> Calling `setInsecure()` disables TLS authentication and exposes all communication to Man-in-the-Middle (MITM) attacks. Use this only for local development, testing, or environments where certificate validation is impossible. If `requireValidatedTls(true)` is active, HTTPS requests will be refused (`-12`) even if `setInsecure()` was called.
+
+```cpp
+void setInsecure();
+```
+
+---
+
+### `requireValidatedTls(require)`
+
+Enables or disables **fail-closed TLS mode**. When enabled (`true`), any `https://` request made without a configured Root CA (`setCACert`) or CA bundle (`setCACertBundle`), or while `setInsecure()` is active, is immediately refused before opening a socket and sets status code `HTTPC_ERROR_TLS_NOT_VALIDATED` (`-12`).
+
+Can also be enabled globally at compile time via `-DESP32HTTPCLIENT_REQUIRE_VALIDATED_TLS=1`.
+
+```cpp
+void requireValidatedTls(bool require = true);
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `require` | `bool` | `true` (default) to enforce validated TLS on all `https://` requests; `false` to allow fallback with a warning log. |
+
+**Example:**
+```cpp
+client.requireValidatedTls(true);
+client.setCACert(root_ca_pem);
+```
+
+---
+
+### `isValidatedTlsRequired()`
+
+Returns `true` if fail-closed TLS validation mode is enabled on this client instance.
+
+```cpp
+bool isValidatedTlsRequired() const;
+```
+
+---
+
+### `hasValidatedTlsConfig()`
+
+Returns `true` if a non-empty Root CA (`setCACert`) or CA bundle (`setCACertBundle`) is configured and `setInsecure()` is not active.
+
+```cpp
+bool hasValidatedTlsConfig() const;
+```
+
+---
+
+### `end()`
+
+Closes the active connection and releases associated resources. For TLS connections, this closes the secure socket and frees mbedTLS internal buffers (~45 KB). The client remains valid and can open a new connection on the next request.
+
+```cpp
+void end();
+```
+
+---
+
+### `getTlsError()`
+
+Returns the underlying mbedTLS error code (`int`) from the last TLS handshake or connection attempt (e.g., negative values such as `MBEDTLS_ERR_X509_CERT_VERIFY_FAILED`). Returns `0` if no TLS error occurred.
+
+```cpp
+int getTlsError() const;
+```
+
+---
+
+### `getTlsErrorMessage()`
+
+Returns a human-readable description of the last mbedTLS error code, formatted with hexadecimal error code representation.
+
+```cpp
+String getTlsErrorMessage() const;
+```
+
+---
+
+### `getTlsErrorHint()`
+
+Returns an actionable troubleshooting hint for the last TLS handshake failure (or fail-closed rejection), inspecting both the mbedTLS error code and the current system clock (`time(nullptr)`). For example, if the system clock is before 2023, it advises synchronizing time via NTP (`configTime()`). Returns `""` if no hint applies.
+
+```cpp
+String getTlsErrorHint() const;
+```
+
+**Example:**
+```cpp
+if (client.hasError() && client.getTlsError() != 0) {
+    Serial.printf("TLS Hint: %s\n", client.getTlsErrorHint().c_str());
+}
+```
+
+---
+
+### `tlsErrorToHint(tlsError, currentEpoch)`
+
+Static helper that maps an mbedTLS error code (and optional Unix timestamp `currentEpoch`; pass `-1` to query `time(nullptr)` automatically) to an actionable diagnostic hint string.
+
+```cpp
+static String tlsErrorToHint(int tlsError, long currentEpoch = -1);
+```
+
 ## Response & Error Inspection
 
 ---
@@ -523,7 +704,7 @@ if (client.hasError()) {
 
 ### `getErrorMessage()`
 
-Returns a human-readable description of the last status or error code.
+Returns a human-readable description of the last status or error code. When an HTTPS request fails with a negative status code, `getErrorMessage()` automatically appends the mbedTLS error message, hex code, and actionable diagnostic hint (`getTlsErrorHint()`).
 
 ```cpp
 String getErrorMessage() const;
@@ -619,6 +800,9 @@ void onError(HttpResponseCallback cb);
 ```cpp
 client.onError([](int code, const char* message) {
     Serial.printf("Client request failed (%d): %s\n", code, message);
+});
+```
+
 ---
 
 ### `onResponse(cb)`
@@ -710,6 +894,7 @@ client.get("/data3").getBody("v", &v3); // reconnects automatically
 | `-9` | Encoding Error | Client error |
 | `-10` | Stream Write Error | Client error |
 | `-11` | Read Timeout | Client error |
+| `-12` | TLS Validation Required | Client error (fail-closed TLS) |
 | `200` | OK | HTTP success |
 | `201` | Created | HTTP success |
 | `202` | Accepted | HTTP success |

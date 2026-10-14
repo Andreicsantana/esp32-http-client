@@ -955,8 +955,10 @@ void JsonRpcRequest::execute() {
   }
   headerKeys.push_back("Content-Type");
 
-  auto setupConnection = [&]() {
-    http.begin(url);
+  auto setupConnection = [&]() -> bool {
+    if (!_client->beginConnection(url, effectiveTimeout)) {
+      return false;
+    }
     if (!headerKeys.empty()) {
       http.collectHeaders(headerKeys.data(), headerKeys.size());
     }
@@ -968,18 +970,19 @@ void JsonRpcRequest::execute() {
     }
     const char* ct = _contentType.isEmpty() ? "application/json" : _contentType.c_str();
     http.addHeader("Content-Type", ct);
+    return true;
   };
 
   unsigned long startTime = millis();
   uint32_t freeHeapBefore = ESP.getFreeHeap();
 
-  setupConnection();
+  bool connected = setupConnection();
 
   int retries = 0;
   int maxR = (_maxRetry >= 0) ? _maxRetry : _client->getMaxRetry();
-  int code = 0;
+  int code = connected ? 0 : _client->_lastStatusCode;
 
-  while (retries <= maxR) {
+  while (connected && retries <= maxR) {
     code = http.POST(payload);
     if (code < 0 && retries < maxR) {
       http.end();
